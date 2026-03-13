@@ -72,13 +72,6 @@ QLoRA trainer                     Sandbox workers (16x pool)
 - **LoRA**: rank=8, alpha=16, all attention + MLP layers, no quantization
 
 ---
-
-## Compute
-
-- Training: A100 80GB (Vast.ai, ~$50–70 for full run)
-- Judge: A100 40GB (same machine, NVLink preferred)
-- Total budget: ~$100
-
 Local smoke test uses Qwen2.5-Coder-1.5B (training) + Qwen2.5-Coder-0.5B (judge).
 
 ---
