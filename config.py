@@ -13,8 +13,15 @@ Everything else imports from this file — never hardcode values elsewhere.
 TRAINING_MODEL = "Qwen/Qwen2.5-Coder-7B-Instruct"
 LOCAL_TRAINING_MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct"  # for local smoke test
 
-# Judge — Gemini API
-JUDGE_MODEL = "gemini-2.5-flash"
+# Judge — Gemini via Vertex AI
+JUDGE_MODEL = "gemini-2.5-flash-lite"
+VERTEX_PROJECT = "grpo-reasoning-2"
+VERTEX_REGION = "us-central1"
+# API key — loaded from .env file (key name: api_key)
+import os
+from dotenv import load_dotenv
+load_dotenv()
+GEMINI_API_KEY = os.environ.get("api_key", "")
 
 # ─────────────────────────────────────────
 # GRPO hyperparameters
@@ -57,13 +64,30 @@ QUANTIZATION = None  # full precision LoRA — A100 80GB has headroom
 # Reward weights (flat across all difficulties and datasets)
 # ─────────────────────────────────────────
 
-EXEC_WEIGHT = 0.65  # execution reward weight
-REASONING_WEIGHT = 0.35  # reasoning reward weight
-# EXEC_WEIGHT + REASONING_WEIGHT must = 1.0
+# Legacy flat weights (overridden by per-source weights below)
+EXEC_WEIGHT = 0.65
+REASONING_WEIGHT = 0.35
 
-GEMINI_WEIGHT = 0.7  # within reasoning: Gemini score weight
-PRESENCE_WEIGHT = 0.3  # within reasoning: presence heuristic weight
-# GEMINI_WEIGHT + PRESENCE_WEIGHT must = 1.0
+# Per-source reward weights
+APPS_EXEC_WEIGHT = 0.75
+APPS_REASONING_WEIGHT = 0.25
+LCB_EXEC_WEIGHT = 0.60
+LCB_REASONING_WEIGHT = 0.40
+
+# Tier-weighted reasoning: Gemini vs presence per difficulty
+# Easy: presence only (Gemini std=0.076, no discrimination)
+EASY_GEMINI_WEIGHT = 0.0
+EASY_PRESENCE_WEIGHT = 1.0
+# Medium: 70% Gemini (std=0.16, confirmed reliable)
+MEDIUM_GEMINI_WEIGHT = 0.7
+MEDIUM_PRESENCE_WEIGHT = 0.3
+# Hard: 30% Gemini (std=0.187 but false negative risk)
+HARD_GEMINI_WEIGHT = 0.3
+HARD_PRESENCE_WEIGHT = 0.7
+
+# Legacy flat weights (kept for backward compat with logging)
+GEMINI_WEIGHT = 0.7
+PRESENCE_WEIGHT = 0.3
 
 REWARD_STD_WARNING_THRESHOLD = 0.05  # reward_std below this → diversity collapse warning
 
@@ -92,6 +116,10 @@ SANDBOX_MAX_WORKERS = 16  # CPU-bound thread pool for parallel sandbox calls
 SANDBOX_TIMEOUT = 5  # seconds per subprocess execution before SIGKILL
 SANDBOX_MEMORY_MB = 512  # memory cap per subprocess (resource.setrlimit)
 MAX_TEST_CASES = 10  # test cases per problem during training (cap for speed)
+
+# Aliases used by reward/execution.py (DO NOT REMOVE)
+EXEC_TIMEOUT = SANDBOX_TIMEOUT
+EXEC_WORKERS = SANDBOX_MAX_WORKERS
 
 # ─────────────────────────────────────────
 # Checkpointing and logging
@@ -149,6 +177,24 @@ CURRICULUM = [
 
 ADAPTIVE_REWARD_THRESHOLD = 0.85  # if problem's running mean reward exceeds this,
 ADAPTIVE_WINDOW = 50  # halve its sampling weight (over last N steps)
+
+
+# ─────────────────────────────────────────
+# Difficulty normalization
+# ─────────────────────────────────────────
+DIFFICULTY_MAP = {
+    "introductory": "easy",
+    "interview": "medium",
+    "competition": "hard",
+    "easy": "easy",
+    "medium": "medium",
+    "hard": "hard",
+}
+
+
+def normalize_difficulty(raw: str) -> str:
+    """Normalize APPS/LCB difficulty to easy/medium/hard."""
+    return DIFFICULTY_MAP.get(raw, "medium")
 
 
 def get_curriculum_weights(step: int) -> dict:
@@ -216,4 +262,14 @@ Evaluate based on:
 - Is the reasoning coherent and progressive (not circular or confused)?
 
 Respond with ONLY a float between 0.0 and 1.0. Nothing else. No explanation."""
+
+# ─────────────────────────────────────────
+# Aliases (must be at end of file — after definitions they reference)
+# ─────────────────────────────────────────
+
+# Used by reward/judge.py
+REASONING_SYSTEM_PROMPT = JUDGE_SYSTEM_PROMPT
+JUDGE_TIMEOUT = GEMINI_TIMEOUT
+JUDGE_TEMPERATURE = 0.0
+JUDGE_MAX_TOKENS = GEMINI_MAX_TOKENS
 

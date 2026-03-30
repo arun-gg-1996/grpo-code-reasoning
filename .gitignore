@@ -18,21 +18,27 @@ env/
 .ipynb_checkpoints/
 *.ipynb
 
-# Environment variables
+# Environment variables — contains API keys, never commit
 .env
 .env.*
 
-# Data — large files, never commit
+# Data — large files, transfer separately via rsync
 data/clean/*.jsonl
 data/failed/
 
-# Model checkpoints and LoRA weights
+# Model checkpoints and weights
 checkpoints/
 outputs/
 *.pt
 *.pth
 *.safetensors
 *.bin
+
+# Eval results
+eval_results.json
+baseline_results.json
+final_results.json
+*_results.json
 
 # Weights & Biases
 wandb/
@@ -50,3 +56,7 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Misc
+*.json.bak
+data/judge_eval_results.json

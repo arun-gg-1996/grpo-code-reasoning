@@ -1,20 +1,13 @@
 """
 reward/judge.py
 
-vLLM HTTP client for the judge model (Qwen2.5-Coder-7B-Instruct).
-All requests are sent concurrently via asyncio + AsyncOpenAI so vLLM's
-internal scheduler can batch them — no sequential blocking.
+Gemini judge via Vertex AI using API key auth.
+Endpoint: https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent?key=API_KEY
 
-The judge server is started separately before training:
-    python -m vllm.entrypoints.openai.api_server \
-        --model Qwen2.5-Coder-7B-Instruct \
-        --port 8000 \
-        --enable-prefix-caching
+Set GEMINI_API_KEY env var before training:
+    export GEMINI_API_KEY=your_key_here
 
-Usage:
-    from reward.judge import JudgeClient
-    judge = JudgeClient(base_url="http://localhost:8000/v1")
-    results = judge.score_reasoning_batch(prompts)  # list of dicts
+All batch calls are concurrent via asyncio.gather.
 """
 
 import asyncio
@@ -22,146 +15,117 @@ import json
 import logging
 from typing import Optional
 
-from openai import AsyncOpenAI
+import httpx
 
-from config import REASONING_SYSTEM_PROMPT, JUDGE_TIMEOUT, JUDGE_TEMPERATURE, JUDGE_MAX_TOKENS
+from config import JUDGE_MODEL, JUDGE_SYSTEM_PROMPT, JUDGE_TEMPERATURE, JUDGE_MAX_TOKENS, JUDGE_TIMEOUT, GEMINI_API_KEY
 
 logger = logging.getLogger(__name__)
 
-
-# ─────────────────────────────────────────
-# Prompt builder
-# ─────────────────────────────────────────
-
-def build_reasoning_prompt(
-        problem: str,
-        reference_reasoning: str,
-        model_reasoning: str,
-) -> str:
-    return f"""Problem:
-{problem}
-
-Reference reasoning:
-{reference_reasoning}
-
-Model's reasoning:
-{model_reasoning}"""
+VERTEX_URL = f"https://aiplatform.googleapis.com/v1/publishers/google/models/{JUDGE_MODEL}:generateContent"
 
 
-# ─────────────────────────────────────────
-# JSON parsing with fallbacks
-# ─────────────────────────────────────────
+def _build_request_body(problem: str, think_block: str, difficulty: str) -> dict:
+    user_prompt = (
+        f"Problem ({difficulty} difficulty):\n{problem}\n\n"
+        f"Model reasoning trace:\n{think_block}\n\n"
+        f"Score the 6 steps and provide an overall score."
+    )
+    return {
+        "system_instruction": {"parts": [{"text": JUDGE_SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": {
+            "temperature": JUDGE_TEMPERATURE,
+            "maxOutputTokens": JUDGE_MAX_TOKENS,
+        },
+    }
 
-def parse_reasoning_response(text: str) -> Optional[dict]:
+
+def parse_judge_response(text: str) -> Optional[dict]:
     """
-    Parse judge JSON response for reasoning scoring.
-    Returns dict with step_1..step_6 and overall, or None on failure.
+    Parse Gemini judge response.
+    Handles two formats:
+      - Plain float: "0.85"
+      - JSON: {"step_scores": [...], "overall": 0.85}
+    Returns dict with "overall" key, or None on failure.
     """
     try:
-        text = text.strip().strip("```json").strip("```").strip()
+        text = text.strip().strip("`").strip()
+        if text.startswith("json"):
+            text = text[4:].strip()
+
+        # Try plain float first (current prompt format)
+        try:
+            overall = max(0.0, min(1.0, float(text)))
+            return {"overall": overall, "step_scores": []}
+        except ValueError:
+            pass
+
+        # Try JSON format
         data = json.loads(text)
-        required = ["step_1", "step_2", "step_3", "step_4", "step_5", "step_6", "overall"]
-        for key in required:
-            if key not in data:
-                data[key] = 0.0
-        for key in required:
-            data[key] = max(0.0, min(1.0, float(data[key])))
-        # recompute overall as mean of steps to guard against judge arithmetic errors
-        steps = [data[f"step_{i}"] for i in range(1, 7)]
-        data["overall"] = sum(steps) / len(steps)
-        return data
+        overall = max(0.0, min(1.0, float(data.get("overall", 0.5))))
+        step_scores = [max(0.0, min(1.0, float(s))) for s in data.get("step_scores", [])[:6]]
+        return {"overall": overall, "step_scores": step_scores}
     except Exception as e:
-        logger.warning(f"Failed to parse reasoning response: {e} | text: {text[:200]}")
+        logger.warning(f"Failed to parse judge response: {e} | text: {text[:200]}")
         return None
 
 
-# ─────────────────────────────────────────
-# Judge client
-# ─────────────────────────────────────────
+async def _call_single(
+    client: httpx.AsyncClient,
+    api_key: str,
+    problem: str,
+    think_block: str,
+    difficulty: str,
+) -> float:
+    """Single async Gemini call. Returns overall score 0.0-1.0. Falls back to 0.5 on error."""
+    body = _build_request_body(problem, think_block, difficulty)
+    url = f"{VERTEX_URL}?key={api_key}"
 
-class JudgeClient:
-    """
-    Async-first judge client for the vLLM OpenAI-compatible endpoint.
-    All batch calls are sent concurrently via asyncio.gather so vLLM
-    receives all requests at once and can schedule them as a single batch.
-    """
+    try:
+        resp = await client.post(url, json=body, timeout=JUDGE_TIMEOUT)
 
-    def __init__(
-            self,
-            base_url: str = "http://localhost:8000/v1",
-            model: str = "Qwen2.5-Coder-7B-Instruct",
-            timeout: int = JUDGE_TIMEOUT,
-            temperature: float = JUDGE_TEMPERATURE,
-            max_tokens: int = JUDGE_MAX_TOKENS,
-    ):
-        self.base_url = base_url
-        self.model = model
-        self.timeout = timeout
-        self.temperature = temperature
-        self.max_tokens = max_tokens
+        if resp.status_code == 429:
+            await asyncio.sleep(2.0)
+            resp = await client.post(url, json=body, timeout=JUDGE_TIMEOUT)
 
-    async def _call_batch_async(
-            self,
-            system_prompt: str,
-            prompts: list[str],
-    ) -> list[str]:
-        """
-        Send all prompts concurrently to the vLLM endpoint.
-        Returns a list of raw response strings, one per prompt.
-        Exceptions are caught per-request and returned as empty strings.
-        """
-        client = AsyncOpenAI(base_url=self.base_url, api_key="EMPTY")
+        resp.raise_for_status()
+        data = resp.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = parse_judge_response(text)
+        return parsed["overall"] if parsed is not None else 0.5
+
+    except Exception as e:
+        logger.warning(f"Gemini API error: {e}")
+        return 0.5
+
+
+async def _score_batch_async(
+    problems: list[str],
+    think_blocks: list[str],
+    difficulties: list[str],
+    api_key: str,
+) -> list[float]:
+    async with httpx.AsyncClient() as client:
         tasks = [
-            client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                timeout=self.timeout,
-            )
-            for prompt in prompts
+            _call_single(client, api_key, prob, think, diff)
+            for prob, think, diff in zip(problems, think_blocks, difficulties)
         ]
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
-        results = []
-        for r in responses:
-            if isinstance(r, Exception):
-                logger.warning(f"Judge async call failed: {r}")
-                results.append("")
-            else:
-                results.append(r.choices[0].message.content or "")
-        return results
+        return await asyncio.gather(*tasks)
 
-    def call_batch(self, system_prompt: str, prompts: list[str]) -> list[str]:
-        """
-        Synchronous wrapper around _call_batch_async.
-        Fires all prompts concurrently and blocks until all responses arrive.
-        """
-        return asyncio.run(self._call_batch_async(system_prompt, prompts))
 
-    def score_reasoning_batch(
-            self,
-            prompts: list[str],
-    ) -> list[dict]:
-        """
-        Score a batch of reasoning traces concurrently.
-        All HTTP requests are sent at once; vLLM batches them internally.
+def score_batch(
+    problems: list[str],
+    think_blocks: list[str],
+    difficulties: list[str],
+) -> list[float]:
+    """
+    Score reasoning traces via Gemini. All calls concurrent.
+    Reads API key from GEMINI_API_KEY env var (set in config.py).
+    Returns list of float scores 0.0-1.0 (0.5 on error).
+    """
+    api_key = GEMINI_API_KEY
+    if not api_key:
+        logger.warning("GEMINI_API_KEY not set — returning 0.5 fallback for all")
+        return [0.5] * len(problems)
 
-        Args:
-            prompts: list of user-message strings (built by build_reasoning_prompt)
-
-        Returns:
-            list of dicts with step_1..step_6 + overall (float 0.0-1.0 each).
-            Failed parses return a fallback dict of all zeros.
-        """
-        fallback = {f"step_{i}": 0.0 for i in range(1, 7)}
-        fallback["overall"] = 0.0
-
-        raw_responses = self.call_batch(REASONING_SYSTEM_PROMPT, prompts)
-        results = []
-        for raw in raw_responses:
-            parsed = parse_reasoning_response(raw)
-            results.append(parsed if parsed is not None else fallback.copy())
-        return results
+    return asyncio.run(_score_batch_async(problems, think_blocks, difficulties, api_key))

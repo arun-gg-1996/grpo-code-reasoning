@@ -1,219 +1,95 @@
 """
 reward/reward.py
 
-Multi-signal reward function for GRPO code generation training.
+Multi-signal reward function for GRPO training.
 
-Reward structure:
-    final_reward = exec_weight * execution_score + reasoning_weight * reasoning_score
+Reward structure (per spec):
+    APPS:  final = 0.75 * exec + 0.25 * reasoning
+    LCB:   final = 0.60 * exec + 0.40 * reasoning
 
-    reasoning_score = 0.7 * gemini_score + 0.3 * presence_score
-        (flat weighting across all difficulties — no tiering)
-        (falls back to presence_score only if Gemini API errors)
+Reasoning scoring tiers:
+    Easy:   presence heuristic only (Gemini std=0.076, no discrimination)
+    Medium: 0.3 * presence + 0.7 * gemini
+    Hard:   0.7 * presence + 0.3 * gemini
 
-Signal coverage tiers (tracked per batch):
-    exec_only       — valid execution score, no structured reasoning trace found
-    exec_presence   — execution + presence score (Gemini failed or skipped)
-    exec_full       — execution + presence + Gemini score
-
-Data flow contract (DO NOT shuffle inside this function):
-    completions: List[str], length = batch_size * G
-    kwargs["difficulty"]: List[str], same length, repeated G times per problem
-    kwargs["test_cases"]: List[Any], same length, repeated G times per problem
-    kwargs["problem_ids"]: List[str], same length, for dataset coverage tracking
-
-    ordering: problem 1 → [0:G], problem 2 → [G:2G], etc.
+Data flow contract (DO NOT shuffle):
+    completions[0:G] → problem 1, completions[G:2G] → problem 2, etc.
     GRPO advantage computation depends on this ordering.
 """
 
 import re
-import time
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
 
 import numpy as np
-import wandb
 
-from sandbox.testing_util import run_test
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 from config import (
-    EXEC_WEIGHT,
-    REASONING_WEIGHT,
-    GEMINI_WEIGHT,
-    PRESENCE_WEIGHT,
-    MIN_STEPS,
-    GEMINI_MAX_WORKERS,
-    SANDBOX_MAX_WORKERS,
-    JUDGE_MODEL,
-    JUDGE_SYSTEM_PROMPT,
-    GEMINI_CORRELATION_INTERVAL,
+    # Per-source weights
+    APPS_EXEC_WEIGHT, APPS_REASONING_WEIGHT,
+    LCB_EXEC_WEIGHT, LCB_REASONING_WEIGHT,
+    # Tier-weighted reasoning
+    EASY_GEMINI_WEIGHT, EASY_PRESENCE_WEIGHT,
+    MEDIUM_GEMINI_WEIGHT, MEDIUM_PRESENCE_WEIGHT,
+    HARD_GEMINI_WEIGHT, HARD_PRESENCE_WEIGHT,
+    # Misc
     GROUP_SIZE,
+    normalize_difficulty,
 )
+from reward.execution import score_batch as exec_score_batch, extract_code, score_single
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Module-level persistent thread pools — do NOT create inside reward_fn
-# ---------------------------------------------------------------------------
-_sandbox_pool = ThreadPoolExecutor(max_workers=SANDBOX_MAX_WORKERS)
-_gemini_pool = ThreadPoolExecutor(max_workers=GEMINI_MAX_WORKERS)
-
-# Dataset coverage tracking — stores problem IDs seen across all steps
+# Dataset coverage tracking
 _seen_problem_ids: set[str] = set()
-
-# Rolling buffers for Gemini-presence correlation (last GEMINI_CORRELATION_INTERVAL steps)
-_gemini_score_buffer: list[float] = []
-_presence_score_buffer: list[float] = []
-
-# Step counter for correlation logging
-_reward_fn_call_count = 0
-
-
-# ---------------------------------------------------------------------------
-# Gemini judge
-# ---------------------------------------------------------------------------
-
-def _call_gemini(reasoning_text: str, problem_description: str) -> float | None:
-    """
-    Call Gemini to score reasoning quality of an already-extracted reasoning trace.
-    Returns float in [0, 1] or None on any error.
-
-    reasoning_text: content extracted from inside <think> tags (pre-extracted by caller)
-    problem_description: the problem statement, for context
-
-    Returns None on API error → caller falls back to presence score.
-    """
-    if not reasoning_text:
-        return None
-
-    try:
-        import google.generativeai as genai
-        from config import GEMINI_API_KEY
-
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(
-            model_name=JUDGE_MODEL,
-            system_instruction=JUDGE_SYSTEM_PROMPT,
-        )
-
-        prompt = f"Problem:\n{problem_description}\n\nReasoning trace:\n{reasoning_text}"
-
-        response = model.generate_content(prompt)
-        score_text = response.text.strip()
-        score = float(score_text)
-        return max(0.0, min(1.0, score))
-
-    except Exception as e:
-        logger.warning(f"Gemini API error: {e}")
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Presence heuristic
-# ---------------------------------------------------------------------------
-
-def _presence_score(completion: str) -> tuple[float, int]:
-    """
-    Score based on presence and count of [STEP] blocks inside <think> tags.
-    Returns (score, steps_found).
-
-    Scoring:
-        steps < MIN_STEPS  → partial credit: steps / MIN_STEPS
-        steps >= MIN_STEPS → 1.0  (never penalize more steps)
-    """
-    # Search inside <think> block if present, else fall back to full completion
-    think_match = re.search(r'<think>(.*?)</think>', completion, re.DOTALL | re.IGNORECASE)
-    search_text = think_match.group(1) if think_match else completion
-
-    steps = re.findall(r'\[STEP\]', search_text, re.IGNORECASE)
-    steps_found = len(steps)
-
-    score = steps_found / MIN_STEPS if steps_found < MIN_STEPS else 1.0
-    return score, steps_found
 
 
 # ---------------------------------------------------------------------------
 # Extraction helpers
 # ---------------------------------------------------------------------------
 
-def _extract_reasoning(completion: str) -> str:
+def _extract_think_block(completion: str) -> str:
     """Extract content inside <think> tags. Returns empty string if not found."""
-    match = re.search(r'<think>(.*?)</think>', completion, re.DOTALL | re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
-    return ""
+    match = re.search(r"<think>(.*?)</think>", completion, re.DOTALL | re.IGNORECASE)
+    return match.group(1).strip() if match else ""
 
 
-def _extract_code(completion: str) -> str | None:
-    """Extract content inside <code> tags. Returns None if not found."""
-    match = re.search(r'<code>(.*?)</code>', completion, re.DOTALL | re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
-    return None
-
-
-def _count_tokens(text: str, tokenizer) -> int:
-    """Count tokens using the actual tokenizer, not whitespace split."""
-    if tokenizer is None:
-        return len(text.split())  # fallback
-    return len(tokenizer(text, return_tensors=None)["input_ids"])
-
-
-def _is_truncated(completion: str, max_new_tokens: int, tokenizer) -> bool:
-    """Check if completion likely hit MAX_NEW_TOKENS cutoff."""
-    token_count = _count_tokens(completion, tokenizer)
-    return token_count >= (max_new_tokens - 10)  # small buffer for off-by-one
-
-
-# ---------------------------------------------------------------------------
-# Per-completion reward computation
-# ---------------------------------------------------------------------------
-
-def _compute_single_reward(
-        completion: str,
-        test_cases: Any,
-        problem_description: str,
-        difficulty: str,
-        tokenizer,
-        max_new_tokens: int,
-) -> dict:
+def _presence_score(think_block: str) -> float:
     """
-    Compute all reward components for a single completion.
-    Returns a dict with all scores and diagnostic info.
-    Does NOT call Gemini — that's handled in parallel separately.
+    Presence heuristic: count [STEP] markers with >=20 chars of content.
+    Score = valid_steps / 6.0, capped at 1.0.
     """
-    code = _extract_code(completion)
-    reasoning = _extract_reasoning(completion)
-    presence, steps_found = _presence_score(completion)
+    if not think_block:
+        return 0.0
 
-    # Execution score
-    if code is not None:
-        try:
-            exec_result = run_test(code, test_cases)
-            exec_score = exec_result.get("passed", 0) / max(exec_result.get("total", 1), 1)
-        except Exception as e:
-            logger.warning(f"Sandbox error: {e}")
-            exec_score = 0.0
-    else:
-        exec_score = 0.0
+    # Split on [STEP] markers (case-insensitive)
+    parts = re.split(r"\[STEP\]", think_block, flags=re.IGNORECASE)
+    # First element is text before the first [STEP], skip it
+    steps = parts[1:] if len(parts) > 1 else []
 
-    # Token counts
-    reasoning_tokens = _count_tokens(reasoning, tokenizer)
-    code_tokens = _count_tokens(code, tokenizer) if code else 0
-    truncated = _is_truncated(completion, max_new_tokens, tokenizer)
+    valid = sum(1 for s in steps[:6] if len(s.strip()) >= 20)
+    return min(valid / 6.0, 1.0)
 
-    return {
-        "exec_score": exec_score,
-        "presence_score": presence,
-        "steps_found": steps_found,
-        "has_code": code is not None,
-        "has_reasoning": len(reasoning) > 0,
-        "reasoning_tokens": reasoning_tokens,
-        "code_tokens": code_tokens,
-        "truncated": truncated,
-        "difficulty": difficulty,
-        "reasoning_text": reasoning,  # pre-extracted, passed directly to Gemini
-        "problem_description": problem_description,
-    }
+
+def _get_tier_weights(difficulty: str) -> tuple[float, float]:
+    """Return (gemini_weight, presence_weight) for a difficulty tier."""
+    if difficulty == "easy":
+        return EASY_GEMINI_WEIGHT, EASY_PRESENCE_WEIGHT
+    elif difficulty == "medium":
+        return MEDIUM_GEMINI_WEIGHT, MEDIUM_PRESENCE_WEIGHT
+    else:  # hard
+        return HARD_GEMINI_WEIGHT, HARD_PRESENCE_WEIGHT
+
+
+def _get_source_weights(source: str) -> tuple[float, float]:
+    """Return (exec_weight, reasoning_weight) for a data source."""
+    if source == "lcb" or source == "lcb_seen":
+        return LCB_EXEC_WEIGHT, LCB_REASONING_WEIGHT
+    else:  # apps
+        return APPS_EXEC_WEIGHT, APPS_REASONING_WEIGHT
 
 
 # ---------------------------------------------------------------------------
@@ -221,257 +97,312 @@ def _compute_single_reward(
 # ---------------------------------------------------------------------------
 
 def reward_fn(
-        completions: list[str],
-        prompts: list[str],
-        tokenizer=None,
-        max_new_tokens: int = 4096,
-        **kwargs,
+    completions: list[str],
+    prompts: list[str],
+    **kwargs,
 ) -> list[float]:
     """
     Main reward function called by GRPOTrainer.
 
     Args:
-        completions: List of model completions, length = batch_size * G
-        prompts: List of prompts, same length
-        tokenizer: HuggingFace tokenizer for token counting
-        max_new_tokens: Training MAX_NEW_TOKENS for truncation detection
+        completions: model completions, length = batch_size * G
+        prompts: prompts, same length (unused but required by TRL)
         **kwargs:
-            difficulty: List[str] — difficulty per completion
-            test_cases: List[Any] — test cases per completion
-            problem_ids: List[str] — problem IDs for coverage tracking
-            problem_descriptions: List[str] — for Gemini judge
+            problems: list[dict] — full problem dicts from JSONL
+            source: list[str] — "apps" or "lcb"/"lcb_seen" per completion
 
     Returns:
-        List[float] of final rewards, same length as completions.
-        ORDER IS PRESERVED — critical for GRPO advantage computation.
+        list[float] of final rewards, ORDER PRESERVED.
     """
-    global _reward_fn_call_count, _gemini_score_buffer, _presence_score_buffer
-
-    _reward_fn_call_count += 1
     n = len(completions)
+    problems = kwargs.get("problems", [{}] * n)
+    sources = kwargs.get("source", ["apps"] * n)
 
-    difficulties = kwargs.get("difficulty", ["unknown"] * n)
-    test_cases_list = kwargs.get("test_cases", [None] * n)
-    problem_ids = kwargs.get("problem_ids", [f"unknown_{i}" for i in range(n)])
-    problem_descriptions = kwargs.get("problem_descriptions", [""] * n)
+    # Normalize difficulties
+    difficulties = [
+        normalize_difficulty(p.get("difficulty", "medium"))
+        for p in problems
+    ]
 
-    # Update dataset coverage
-    _seen_problem_ids.update(problem_ids)
-
-    # ------------------------------------------------------------------
-    # Step 1: Run sandbox in parallel (CPU-bound)
-    # ------------------------------------------------------------------
-    sandbox_futures = {}
-    for i, completion in enumerate(completions):
-        future = _sandbox_pool.submit(
-            _compute_single_reward,
-            completion,
-            test_cases_list[i],
-            problem_descriptions[i],
-            difficulties[i],
-            tokenizer,
-            max_new_tokens,
-        )
-        sandbox_futures[future] = i
-
-    sandbox_results = [None] * n
-    for future in as_completed(sandbox_futures):
-        i = sandbox_futures[future]
-        try:
-            sandbox_results[i] = future.result()
-        except Exception as e:
-            logger.error(f"Sandbox future error at index {i}: {e}")
-            sandbox_results[i] = {
-                "exec_score": 0.0, "presence_score": 0.0, "steps_found": 0,
-                "has_code": False, "has_reasoning": False,
-                "reasoning_tokens": 0, "code_tokens": 0, "truncated": False,
-                "difficulty": difficulties[i], "reasoning_text": "",
-                "problem_description": problem_descriptions[i],
-            }
+    # Track dataset coverage
+    for p in problems:
+        pid = p.get("problem_id") or p.get("question_id", "")
+        if pid:
+            _seen_problem_ids.add(str(pid))
 
     # ------------------------------------------------------------------
-    # Step 2: Run Gemini in parallel (I/O-bound)
+    # Step 1: Extract code and think blocks
     # ------------------------------------------------------------------
-    gemini_futures = {}
-    for i, result in enumerate(sandbox_results):
-        if result["has_reasoning"]:
-            future = _gemini_pool.submit(
-                _call_gemini,
-                result["reasoning_text"],
-                result["problem_description"],
-            )
-            gemini_futures[future] = i
-
-    gemini_results = [None] * n  # None = API error or no reasoning
-    gemini_errors = 0
-    gemini_latencies = []
-
-    for future in as_completed(gemini_futures):
-        i = gemini_futures[future]
-        t0 = time.time()
-        try:
-            score = future.result()
-            gemini_results[i] = score
-            if score is None:
-                gemini_errors += 1
-        except Exception as e:
-            logger.warning(f"Gemini future error at index {i}: {e}")
-            gemini_errors += 1
-        gemini_latencies.append((time.time() - t0) * 1000)
+    codes = [extract_code(c) or "" for c in completions]
+    think_blocks = [_extract_think_block(c) for c in completions]
 
     # ------------------------------------------------------------------
-    # Step 3: Combine scores
+    # Step 2: Execution scoring (parallel via subprocess pool)
     # ------------------------------------------------------------------
-    final_rewards = []
-    signal_tier = []  # "exec_only", "exec_presence", "exec_full"
+    try:
+        exec_scores, exec_stats = exec_score_batch(codes=codes, problems=problems)
+    except AssertionError:
+        # Fallback to sequential scoring (e.g., when called from daemon process)
+        logger.warning("score_batch failed (daemon process?), falling back to sequential")
+        exec_scores = [score_single(c, p) for c, p in zip(codes, problems)]
+        exec_stats = {
+            "mean_score": sum(exec_scores) / len(exec_scores) if exec_scores else 0,
+            "zero_scores": sum(1 for s in exec_scores if s == 0.0),
+            "perfect_scores": sum(1 for s in exec_scores if s == 1.0),
+        }
 
-    batch_gemini_scores = []
-    batch_presence_scores = []
+    # ------------------------------------------------------------------
+    # Step 3: Presence heuristic for all completions
+    # ------------------------------------------------------------------
+    presence_scores = [_presence_score(tb) for tb in think_blocks]
+
+    # ------------------------------------------------------------------
+    # Step 4: Gemini judge for medium/hard with think blocks
+    # ------------------------------------------------------------------
+    # Collect indices that need Gemini calls
+    gemini_indices = []
+    gemini_problems = []
+    gemini_thinks = []
+    gemini_diffs = []
 
     for i in range(n):
-        r = sandbox_results[i]
-        exec_score = r["exec_score"]
-        presence_score = r["presence_score"]
-        gemini_score = gemini_results[i]
+        if think_blocks[i] and difficulties[i] in ("medium", "hard"):
+            gemini_indices.append(i)
+            gemini_problems.append(problems[i].get("question", ""))
+            gemini_thinks.append(think_blocks[i])
+            gemini_diffs.append(difficulties[i])
 
-        if not r["has_reasoning"]:
-            # No <think> block found at all
-            reasoning_score = 0.0
-            tier = "exec_only"
-        elif gemini_score is None:
-            # Gemini failed — fall back to presence only
-            reasoning_score = presence_score
-            tier = "exec_presence"
-        else:
-            # Full signal
-            reasoning_score = GEMINI_WEIGHT * gemini_score + PRESENCE_WEIGHT * presence_score
-            tier = "exec_full"
-            batch_gemini_scores.append(gemini_score)
-            batch_presence_scores.append(presence_score)
+    gemini_scores = [None] * n  # None = not called or no think block
 
-        final_reward = EXEC_WEIGHT * exec_score + REASONING_WEIGHT * reasoning_score
-        final_rewards.append(final_reward)
-        signal_tier.append(tier)
-
-    # ------------------------------------------------------------------
-    # Step 4: Compute diagnostics
-    # ------------------------------------------------------------------
-    diff_array = np.array(difficulties)
-    reward_array = np.array(final_rewards)
-    exec_array = np.array([r["exec_score"] for r in sandbox_results])
-
-    # Per-difficulty masks
-    easy_mask = diff_array == "easy"
-    medium_mask = diff_array == "medium"
-    hard_mask = diff_array == "hard"
-
-    # Degenerate group detection — reshape into (n_problems, G) groups
-    n_problems = n // GROUP_SIZE
-    reward_groups = reward_array.reshape(n_problems, GROUP_SIZE)
-    group_stds = reward_groups.std(axis=1)
-    all_zero = (reward_groups == 0.0).all(axis=1)
-    all_correct = (reward_groups >= 0.99).all(axis=1)
-
-    # Signal tier fractions
-    tier_array = np.array(signal_tier)
-    exec_only_frac = (tier_array == "exec_only").mean()
-    exec_presence_frac = (tier_array == "exec_presence").mean()
-    exec_full_frac = (tier_array == "exec_full").mean()
-
-    # Steps and tokens
-    steps_all = np.array([r["steps_found"] for r in sandbox_results])
-    reasoning_tokens_all = np.array([r["reasoning_tokens"] for r in sandbox_results])
-    code_tokens_all = np.array([r["code_tokens"] for r in sandbox_results])
-
-    # Update rolling correlation buffers
-    _gemini_score_buffer.extend(batch_gemini_scores)
-    _presence_score_buffer.extend(batch_presence_scores)
-    max_buffer = GEMINI_CORRELATION_INTERVAL * n
-    _gemini_score_buffer = _gemini_score_buffer[-max_buffer:]
-    _presence_score_buffer = _presence_score_buffer[-max_buffer:]
-
-    # ------------------------------------------------------------------
-    # Step 5: WandB logging
-    # ------------------------------------------------------------------
-    log_dict = {}
-
-    # --- Reward signals ---
-    log_dict["reward/mean"] = reward_array.mean()
-    log_dict["reward/std"] = reward_array.std()
-    log_dict["reward/non_zero_fraction"] = (reward_array > 0).mean()
-    log_dict["reward/execution_mean"] = exec_array.mean()
-
-    reasoning_scores_all = np.array([
-        GEMINI_WEIGHT * (gemini_results[i] or 0) + PRESENCE_WEIGHT * sandbox_results[i]["presence_score"]
-        if gemini_results[i] is not None
-        else sandbox_results[i]["presence_score"]
-        for i in range(n)
-    ])
-    log_dict["reward/reasoning_mean"] = reasoning_scores_all.mean()
-
-    for mask, name in [(easy_mask, "easy"), (medium_mask, "medium"), (hard_mask, "hard")]:
-        if mask.sum() > 0:
-            log_dict[f"reward/execution_{name}"] = exec_array[mask].mean()
-            log_dict[f"reward/reasoning_{name}"] = reasoning_scores_all[mask].mean()
-
-    # --- Signal coverage tiers ---
-    log_dict["reward/exec_only_fraction"] = exec_only_frac
-    log_dict["reward/exec_presence_fraction"] = exec_presence_frac
-    log_dict["reward/exec_full_fraction"] = exec_full_frac
-
-    # --- GRPO degenerate groups ---
-    log_dict["grpo/all_zero_fraction"] = all_zero.mean()
-    log_dict["grpo/all_correct_fraction"] = all_correct.mean()
-    log_dict["grpo/degenerate_fraction"] = (all_zero | all_correct).mean()
-    log_dict["grpo/reward_std_mean"] = group_stds.mean()
-
-    # --- Generation quality ---
-    log_dict["gen/valid_code_fraction"] = np.array([r["has_code"] for r in sandbox_results]).mean()
-    log_dict["gen/truncated_fraction"] = np.array([r["truncated"] for r in sandbox_results]).mean()
-    log_dict["gen/empty_completion_fraction"] = np.array([
-        len(c.strip()) == 0 for c in completions
-    ]).mean()
-    log_dict["gen/steps_count_mean"] = steps_all.mean()
-    log_dict["gen/reasoning_tokens_mean"] = reasoning_tokens_all.mean()
-    log_dict["gen/code_tokens_mean"] = code_tokens_all.mean()
-
-    for mask, name in [(easy_mask, "easy"), (medium_mask, "medium"), (hard_mask, "hard")]:
-        if mask.sum() > 0:
-            log_dict[f"gen/steps_count_{name}"] = steps_all[mask].mean()
-            log_dict[f"gen/valid_code_{name}"] = np.array([r["has_code"] for r in sandbox_results])[mask].mean()
-            log_dict[f"gen/reasoning_tokens_{name}"] = reasoning_tokens_all[mask].mean()
-            log_dict[f"gen/code_tokens_{name}"] = code_tokens_all[mask].mean()
-
-    # --- Gemini judge reliability ---
-    total_gemini_calls = len(gemini_futures)
-    log_dict["judge/gemini_error_rate"] = gemini_errors / max(total_gemini_calls, 1)
-    log_dict["judge/gemini_latency_mean"] = np.mean(gemini_latencies) if gemini_latencies else 0.0
-
-    for mask, name in [(easy_mask, "easy"), (medium_mask, "medium"), (hard_mask, "hard")]:
-        if mask.sum() > 0:
-            errors_in_diff = sum(
-                1 for i in range(n)
-                if diff_array[i] == name and i in gemini_futures and gemini_results[i] is None
+    if gemini_indices:
+        try:
+            from reward.judge import score_batch as judge_score_batch
+            raw_scores = judge_score_batch(
+                problems=gemini_problems,
+                think_blocks=gemini_thinks,
+                difficulties=gemini_diffs,
             )
-            calls_in_diff = sum(1 for i in range(n) if diff_array[i] == name and i in gemini_futures)
-            log_dict[f"judge/fallback_fraction_{name}"] = errors_in_diff / max(calls_in_diff, 1)
+            for idx, score in zip(gemini_indices, raw_scores):
+                gemini_scores[idx] = score
+        except Exception as e:
+            logger.warning(f"Gemini batch call failed, falling back to presence: {e}")
 
-    # --- Dataset coverage ---
-    log_dict["data/unique_problems_seen"] = len(_seen_problem_ids)
-    hard_problem_ids = set(problem_ids[i] for i in range(n) if difficulties[i] == "hard")
-    log_dict["data/hard_problems_attempted_this_batch"] = len(hard_problem_ids)
+    # ------------------------------------------------------------------
+    # Step 5: Combine scores per spec
+    # ------------------------------------------------------------------
+    final_rewards = []
+    reasoning_scores = []
 
-    # --- Gemini-presence correlation (every N steps) ---
-    if (
-            _reward_fn_call_count % GEMINI_CORRELATION_INTERVAL == 0
-            and len(_gemini_score_buffer) > 10
-    ):
-        corr = np.corrcoef(_gemini_score_buffer, _presence_score_buffer)[0, 1]
-        log_dict["judge/gemini_presence_correlation"] = corr if not np.isnan(corr) else 0.0
+    for i in range(n):
+        diff = difficulties[i]
+        source = sources[i]
 
-    try:
-        wandb.log(log_dict)
-    except Exception as e:
-        logger.warning(f"WandB logging failed: {e}")
+        # Reasoning score: tiered
+        if not think_blocks[i]:
+            # Case A: no <think> block
+            reasoning_score = 0.0
+        else:
+            gem_w, pres_w = _get_tier_weights(diff)
+            if gem_w == 0.0 or gemini_scores[i] is None:
+                # Easy tier, or Gemini failed
+                reasoning_score = presence_scores[i]
+            else:
+                reasoning_score = (
+                    pres_w * presence_scores[i] + gem_w * gemini_scores[i]
+                )
+
+        reasoning_scores.append(reasoning_score)
+
+        # Per-source weighting
+        exec_w, reas_w = _get_source_weights(source)
+        reward = exec_w * exec_scores[i] + reas_w * reasoning_score
+        final_rewards.append(reward)
+
+    # ------------------------------------------------------------------
+    # Step 6: WandB logging
+    # ------------------------------------------------------------------
+    _log_metrics(
+        final_rewards, exec_scores, presence_scores, gemini_scores,
+        reasoning_scores, difficulties, think_blocks, codes, completions, exec_stats,
+    )
 
     return final_rewards
+
+
+def _log_metrics(
+    rewards, exec_scores, presence_scores, gemini_scores,
+    reasoning_scores, difficulties, think_blocks, codes, completions, exec_stats,
+):
+    """Log comprehensive metrics to WandB and emit console warnings on threshold breaches."""
+    try:
+        n = len(rewards)
+        reward_arr = np.array(rewards)
+        exec_arr = np.array(exec_scores)
+        presence_arr = np.array(presence_scores)
+        reasoning_arr = np.array(reasoning_scores)
+        diff_arr = np.array(difficulties)
+
+        log_dict = {
+            # Reward signals
+            "reward/mean": reward_arr.mean(),
+            "reward/std": reward_arr.std(),
+            "reward/non_zero_fraction": (reward_arr > 0).mean(),
+            "reward/execution_mean": exec_arr.mean(),
+            "reward/reasoning_mean": reasoning_arr.mean(),
+            # Execution stats
+            "exec/mean_score": exec_stats.get("mean_score", 0),
+            "exec/zero_scores": exec_stats.get("zero_scores", 0),
+            "exec/perfect_scores": exec_stats.get("perfect_scores", 0),
+            "exec/timeout_count": exec_stats.get("timeout_count", 0),
+            "exec/timeout_fraction": exec_stats.get("timeout_fraction", 0.0),
+            # Presence / reasoning quality
+            "presence/mean": presence_arr.mean(),
+            # Generation quality
+            "gen/valid_code_fraction": sum(1 for c in codes if c) / n,
+            "gen/has_reasoning_fraction": sum(1 for t in think_blocks if t) / n,
+            "gen/empty_completion_fraction": sum(1 for c in completions if not c.strip()) / n,
+            # Dataset coverage
+            "data/unique_problems_seen": len(_seen_problem_ids),
+        }
+
+        # Per-difficulty breakdown
+        for diff_name in ("easy", "medium", "hard"):
+            mask = diff_arr == diff_name
+            if mask.sum() > 0:
+                log_dict[f"reward/mean_{diff_name}"] = reward_arr[mask].mean()
+                log_dict[f"reward/execution_{diff_name}"] = exec_arr[mask].mean()
+                log_dict[f"reward/reasoning_{diff_name}"] = reasoning_arr[mask].mean()
+
+        # Gemini stats
+        gemini_called = [i for i in range(n) if gemini_scores[i] is not None]
+        if gemini_called:
+            g_scores = [gemini_scores[i] for i in gemini_called]
+            log_dict["judge/gemini_mean"] = np.mean(g_scores)
+            log_dict["judge/gemini_calls"] = len(gemini_called)
+
+        # Execution zero/low split
+        exec_zero_frac = (exec_arr == 0.0).mean()
+        nonzero_exec = exec_arr[exec_arr > 0.0]
+        exec_nonzero_mean = float(nonzero_exec.mean()) if len(nonzero_exec) > 0 else None
+        log_dict["exec/zero_fraction"] = exec_zero_frac
+        if exec_nonzero_mean is not None:
+            log_dict["exec/nonzero_mean"] = exec_nonzero_mean
+
+        # GRPO group diagnostics
+        n_problems = n // GROUP_SIZE if GROUP_SIZE > 0 else 0
+        if n_problems > 0 and n == n_problems * GROUP_SIZE:
+            groups = reward_arr.reshape(n_problems, GROUP_SIZE)
+            group_stds = groups.std(axis=1)
+            log_dict["grpo/reward_std_mean"] = group_stds.mean()
+            log_dict["grpo/all_zero_fraction"] = (groups == 0.0).all(axis=1).mean()
+            log_dict["grpo/all_perfect_fraction"] = (groups >= 0.99).all(axis=1).mean()
+
+        # ── Early warning system ──────────────────────────────────────────
+        # Evaluate all thresholds, collect fired warnings, then log to wandb
+        warnings_fired = {}  # key → message
+
+        reward_std_mean = log_dict.get("grpo/reward_std_mean")
+        if reward_std_mean is not None and reward_std_mean < 0.05:
+            warnings_fired["grpo/warn_reward_std_collapse"] = (
+                f"GRPO signal collapsing — reward_std_mean={reward_std_mean:.4f} < 0.05. "
+                "All rollouts getting similar rewards; advantage estimates are noise."
+            )
+
+        non_zero_frac = log_dict.get("reward/non_zero_fraction", 1.0)
+        if non_zero_frac < 0.2:
+            warnings_fired["warn/format_failure"] = (
+                f"Format failure — only {non_zero_frac:.1%} of completions have non-zero reward. "
+                "Model may not be following output format (missing <code> tags)."
+            )
+
+        all_zero_frac = log_dict.get("grpo/all_zero_fraction")
+        if all_zero_frac is not None and all_zero_frac > 0.5:
+            warnings_fired["grpo/warn_all_zero_collapse"] = (
+                f"GRPO collapse — {all_zero_frac:.1%} of groups are all-zero reward. "
+                "Advantage is undefined for these groups; learning has stalled."
+            )
+
+        if exec_zero_frac > 0.8:
+            valid_code_frac = log_dict.get("gen/valid_code_fraction", 1.0)
+            if valid_code_frac < 0.5:
+                warnings_fired["warn/exec_formatting_breakdown"] = (
+                    f"Formatting breakdown — {exec_zero_frac:.1%} execution zero, "
+                    f"only {valid_code_frac:.1%} completions have valid code blocks. "
+                    "Model has stopped producing <code> tags."
+                )
+            else:
+                warnings_fired["warn/exec_zero_sandbox"] = (
+                    f"Execution zero rate critical — {exec_zero_frac:.1%} zero, "
+                    "but code blocks are present. Check test case format or sandbox errors."
+                )
+
+        if exec_nonzero_mean is not None and exec_nonzero_mean < 0.15 and exec_zero_frac < 0.8:
+            warnings_fired["warn/exec_low_nonzero"] = (
+                f"Model capability issue — execution scores low but non-zero "
+                f"(nonzero mean={exec_nonzero_mean:.3f}). Code runs but fails most test cases."
+            )
+
+        has_reasoning_frac = log_dict.get("gen/has_reasoning_fraction", 1.0)
+        if has_reasoning_frac < 0.2:
+            warnings_fired["warn/reasoning_collapse"] = (
+                f"Reasoning collapse — only {has_reasoning_frac:.1%} of completions "
+                "have <think> blocks. Model has stopped reasoning; reasoning reward signal is dead."
+            )
+
+        gemini_mean = log_dict.get("judge/gemini_mean")
+        gemini_calls = log_dict.get("judge/gemini_calls", 0)
+        if gemini_calls > 4 and gemini_mean is not None and abs(gemini_mean - 0.5) < 0.02:
+            warnings_fired["warn/gemini_silent_failure"] = (
+                f"Gemini judge may be silently failing — mean score={gemini_mean:.3f} "
+                "is suspiciously close to the 0.5 fallback value. Check API key and quota."
+            )
+
+        all_perfect_frac = log_dict.get("grpo/all_perfect_fraction")
+        if all_perfect_frac is not None and all_perfect_frac > 0.5:
+            warnings_fired["warn/problems_too_easy"] = (
+                f"Problems too easy — {all_perfect_frac:.1%} of groups are all-perfect. "
+                "No contrast within groups; GRPO has no learning signal."
+            )
+
+        empty_frac = log_dict.get("gen/empty_completion_fraction", 0.0)
+        if empty_frac > 0.3:
+            warnings_fired["warn/empty_completions"] = (
+                f"Empty completions — {empty_frac:.1%} of completions are empty strings. "
+                "Model has stopped generating output entirely."
+            )
+
+        timeout_frac = log_dict.get("exec/timeout_fraction", 0.0)
+        if timeout_frac > 0.3:
+            warnings_fired["warn/high_timeout_rate"] = (
+                f"High timeout rate — {timeout_frac:.1%} of executions timed out. "
+                "Consider increasing EXEC_TIMEOUT in config or reducing MAX_TEST_CASES."
+            )
+
+        # Log to wandb: metrics + binary warning flags
+        if wandb is not None and wandb.run is not None:
+            wandb.log(log_dict)
+            # Binary flags (1 = fired, 0 = clear) so warnings are visible on the dashboard
+            flag_dict = {k: 1 for k in warnings_fired}
+            for key in [
+                "grpo/warn_reward_std_collapse", "grpo/warn_all_zero_collapse",
+                "warn/format_failure", "warn/exec_formatting_breakdown",
+                "warn/exec_zero_sandbox", "warn/exec_low_nonzero",
+                "warn/reasoning_collapse", "warn/gemini_silent_failure",
+                "warn/problems_too_easy", "warn/empty_completions", "warn/high_timeout_rate",
+            ]:
+                if key not in flag_dict:
+                    flag_dict[key] = 0
+            wandb.log(flag_dict)
+            # Send push alert for each fired warning
+            for key, msg in warnings_fired.items():
+                try:
+                    wandb.alert(title=key, text=msg, level=wandb.AlertLevel.WARN)
+                except Exception:
+                    pass  # alerts are best-effort
+
+        # Always print to console regardless of wandb
+        for msg in warnings_fired.values():
+            logger.warning(f"WARNING: {msg}")
+
+    except Exception as e:
+        logger.warning(f"WandB logging failed: {e}")

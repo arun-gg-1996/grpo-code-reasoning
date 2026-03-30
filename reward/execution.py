@@ -41,6 +41,40 @@ def _stdio_worker(solution: str, test_cases: list, result_queue):
         result_queue.put(("error", str(e)))
 
 
+def _parse_functional_input(input_str: str) -> list:
+    """
+    Parse a functional test input string into a list of Python arguments.
+    Handles two formats:
+      - Single-line: '["a", "b"]'   → [["a", "b"]]   (one list argument)
+      - Multi-line:  '[1,2]\n[3,4]' → [[1,2], [3,4]] (two arguments)
+    """
+    import ast, json as _json
+    lines = [l.strip() for l in input_str.strip().split("\n") if l.strip()]
+    args = []
+    for line in lines:
+        try:
+            args.append(_json.loads(line))
+        except Exception:
+            try:
+                args.append(ast.literal_eval(line))
+            except Exception:
+                args.append(line)
+    return args
+
+
+def _parse_functional_output(output_str: str):
+    """Parse a functional test output string into a Python object."""
+    import ast, json as _json
+    s = output_str.strip()
+    try:
+        return _json.loads(s)
+    except Exception:
+        try:
+            return ast.literal_eval(s)
+        except Exception:
+            return s
+
+
 def _functional_worker(solution: str, func_name: str, test_cases: list, result_queue):
     sys.set_int_max_str_digits(100000)
     try:
@@ -48,8 +82,8 @@ def _functional_worker(solution: str, func_name: str, test_cases: list, result_q
         from sandbox.testing_util import run_test
 
         io = {
-            "inputs": [tc["input"] for tc in test_cases],
-            "outputs": [tc["output"] for tc in test_cases],
+            "inputs": [_parse_functional_input(tc["input"]) for tc in test_cases],
+            "outputs": [_parse_functional_output(tc["output"]) for tc in test_cases],
             "fn_name": func_name,
         }
         results = run_test(problem={"input_output": io}, test=solution)
@@ -134,8 +168,39 @@ def score_single(
 # ─────────────────────────────────────────
 
 def _pool_worker_wrapper(args):
+    """Returns (score, status) where status is 'ok', 'timeout', 'error', or 'empty'."""
     code, problem, timeout = args
-    return score_single(code, problem, timeout)
+
+    if not code or not code.strip():
+        return 0.0, "empty"
+
+    test_cases = problem.get("test_cases", [])
+    if not test_cases:
+        return 0.0, "empty"
+
+    test_cases = test_cases[:MAX_TEST_CASES]
+    is_lc = problem.get("is_leetcode", False)
+    func_name = problem.get("func_name", "")
+
+    if is_lc and func_name:
+        status, result = _run_subprocess(
+            _functional_worker,
+            (code, func_name, problem.get("functional_tests", test_cases)),
+            timeout,
+        )
+    else:
+        status, result = _run_subprocess(
+            _stdio_worker,
+            (code, problem.get("stdin_tests", test_cases)),
+            timeout,
+        )
+
+    if status == "ok":
+        return float(result), "ok"
+    elif status == "timeout":
+        return 0.0, "timeout"
+    else:
+        return 0.0, "error"
 
 
 def score_batch(
@@ -155,7 +220,7 @@ def score_batch(
 
     Returns:
         tuple of (scores, stats) where scores is list of floats
-        same length as codes, stats has mean/zero/perfect counts (to see if we should move to DAPO later)
+        same length as codes, stats has mean/zero/perfect/timeout counts
     """
     assert len(codes) == len(problems), "codes and problems must have same length"
 
@@ -164,12 +229,18 @@ def score_batch(
     # use spawn context for pool to avoid nested fork issues
     ctx = multiprocessing.get_context("spawn")
     with ctx.Pool(processes=n_workers) as pool:
-        scores = pool.map(_pool_worker_wrapper, args)
+        results = pool.map(_pool_worker_wrapper, args)
+
+    scores = [r[0] for r in results]
+    statuses = [r[1] for r in results]
+    n = len(scores)
 
     stats = {
-        "mean_score": sum(scores) / len(scores),
+        "mean_score": sum(scores) / n,
         "zero_scores": sum(1 for s in scores if s == 0.0),
         "perfect_scores": sum(1 for s in scores if s == 1.0),
+        "timeout_count": sum(1 for s in statuses if s == "timeout"),
+        "timeout_fraction": sum(1 for s in statuses if s == "timeout") / n,
     }
     return scores, stats
 
@@ -188,8 +259,12 @@ def extract_code(response: str) -> Optional[str]:
     match = re.search(r"<code>(.*?)</code>", response, re.DOTALL)
     if match:
         return match.group(1).strip()
-    # fallback: try ```python blocks
+    # fallback: ```python blocks
     match = re.search(r"```python\s*(.*?)```", response, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    # fallback: any ``` block
+    match = re.search(r"```\s*(.*?)```", response, re.DOTALL)
     if match:
         return match.group(1).strip()
     return None
