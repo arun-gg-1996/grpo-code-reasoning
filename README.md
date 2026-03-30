@@ -65,22 +65,41 @@ HUB_MODEL_ID = "your-hf-username/grpo-qwen-coder"  # where checkpoints are pushe
 
 ## Running
 
-### Smoke test — verify pipeline works (any machine)
+### Step 1 — Logic and sandbox smoke test (no GPU, no API calls)
+```bash
+python smoke_test.py
+```
+Tests imports, config logic, reward computation, and sandbox execution. Fast (~1 min). Run this first.
+
+### Step 2 — Full pipeline smoke test (no GPU needed)
 ```bash
 python train.py --smoke-test
 ```
-Takes ~20 min on CPU. Runs 2 steps with 1.5B model. Should complete without errors.
+Runs 2 training steps with 1.5B model on CPU. Tests the full GRPOTrainer pipeline end-to-end.
+On CPU: ~20 min. On GPU: ~2 min.
 
-### Baseline eval — before training
+### Step 3 — Verify Gemini API (on the cloud, before full training)
+```bash
+python -c "
+from dotenv import load_dotenv; load_dotenv()
+from reward.judge import score_batch
+scores = score_batch(['Test problem'], ['[STEP] thinking about this'], ['medium'])
+print('Gemini OK:', scores)
+"
+```
+Neither smoke test makes a live Gemini call — run this once on the server to confirm the API key works.
+
+### Step 4 — Baseline eval (optional, before training)
 ```bash
 python eval.py --model Qwen/Qwen2.5-Coder-7B-Instruct --output baseline_results.json
 ```
 
-### Full training — A100 80GB
+### Step 5 — Full training (A100 80GB)
 ```bash
 python train.py
 ```
 ~2000 steps, ~24–36 hours. Checkpoints saved every 200 steps to `checkpoints/` and pushed to HF Hub.
+wandb and vLLM are only exercised here — the first few steps will confirm they work.
 
 ### Eval after training
 ```bash
@@ -90,6 +109,21 @@ python eval.py --model checkpoints/Qwen2.5-Coder-7B-Instruct-grpo --output final
 # From HF Hub
 python eval.py --model your-hf-username/grpo-qwen-coder --output final_results.json
 ```
+
+### What each step covers
+
+| | `smoke_test.py` | `train.py --smoke-test` | Full training |
+|---|---|---|---|
+| Imports + config | ✓ | ✓ | ✓ |
+| Sandbox execution | ✓ | ✓ | ✓ |
+| reward_fn logic | ✓ | ✓ | ✓ |
+| Data loading | ✓ | ✓ | ✓ |
+| GRPOTrainer loop | — | ✓ | ✓ |
+| GPU | — | — | ✓ |
+| vLLM | — | — | ✓ |
+| Live Gemini API | — | — | ✓ (step 3 above) |
+| wandb logging | — | — | ✓ |
+| HF Hub push | — | — | ✓ |
 
 ---
 
