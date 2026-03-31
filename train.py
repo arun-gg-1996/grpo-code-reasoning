@@ -44,7 +44,6 @@ from config import (
     GROUP_SIZE,
     BATCH_SIZE,
     MAX_NEW_TOKENS,
-    MAX_PROMPT_LENGTH,
     ROLLOUT_TEMPERATURE,
     LEARNING_RATE,
     KL_COEFF,
@@ -57,7 +56,8 @@ from config import (
     SAVE_STEPS,
     LOGGING_STEPS,
     WANDB_PROJECT,
-    CURRICULUM,
+    PUSH_TO_HUB,
+    HUB_MODEL_ID,
     get_curriculum_weights,
     normalize_difficulty,
 )
@@ -167,15 +167,13 @@ def problems_to_dataset(problems: list[dict]) -> Dataset:
 # Reward wrapper for GRPOTrainer
 # ---------------------------------------------------------------------------
 
-def make_reward_fn(all_problems_map: dict):
+def make_reward_fn():
     """
-    Create a reward function closure that GRPOTrainer can call.
-
+    Create the reward function closure for GRPOTrainer.
     GRPOTrainer calls: reward_fn(completions, prompts, **kwargs)
-    where completions and prompts are lists of strings.
+    Problem metadata is passed through kwargs via the dataset columns.
     """
     def _reward(completions: list[str], prompts: list[str], **kwargs) -> list[float]:
-        # Reconstruct problem dicts from the metadata
         problem_jsons = kwargs.get("problem_json", [])
         sources = kwargs.get("source", [])
 
@@ -255,15 +253,32 @@ def main():
     for d, ps in problems_by_diff.items():
         logger.info(f"  {d}: {len(ps)} problems")
 
-    # Build a full dataset for GRPOTrainer (it handles sampling internally)
-    # We provide all problems; curriculum sampling happens via the dataset
-    dataset = problems_to_dataset(all_problems)
+    # Pre-build curriculum-weighted dataset.
+    # sample_batch applies get_curriculum_weights(step) at each step, so the dataset
+    # has the correct difficulty distribution across all phases baked in.
+    # Note: TRL's GRPOTrainer uses its own random sampler, so phase ordering is not
+    # preserved — but the overall distribution (more easy early, more hard later on
+    # average) is correct since the dataset is sampled from with replacement randomly.
+    logger.info("Building curriculum-weighted dataset...")
+    all_sampled = []
+    for step in range(max_steps):
+        batch = sample_batch(problems_by_diff, step, batch_size)
+        all_sampled.extend(batch)
+    dataset = problems_to_dataset(all_sampled)
 
-    # If smoke test, trim dataset
-    if args.smoke_test:
-        dataset = dataset.select(range(min(20, len(dataset))))
-
-    logger.info(f"Dataset size: {len(dataset)} problems")
+    # Log curriculum distribution that was baked in
+    diff_counts: dict[str, int] = {}
+    src_counts: dict[str, int] = {}
+    for p in all_sampled:
+        d = p["difficulty"]
+        s = p.get("source", "unknown")
+        diff_counts[d] = diff_counts.get(d, 0) + 1
+        src_counts[s] = src_counts.get(s, 0) + 1
+    logger.info(f"Dataset: {len(dataset)} rows ({max_steps} steps × {batch_size} problems/step)")
+    for d, c in sorted(diff_counts.items()):
+        logger.info(f"  difficulty: {d}={c} ({c / len(all_sampled):.1%})")
+    for s, c in sorted(src_counts.items()):
+        logger.info(f"  source: {s}={c} ({c / len(all_sampled):.1%})")
 
     # Load tokenizer
     logger.info(f"Loading model: {model_name}")
@@ -299,19 +314,15 @@ def main():
         report_to="wandb" if use_wandb else "none",
         bf16=not args.smoke_test,
         use_cpu=args.smoke_test,
-        model_init_kwargs={"torch_dtype": "float32"} if args.smoke_test else None,
+        model_init_kwargs={"torch_dtype": "float32", "device_map": "cpu"} if args.smoke_test else None,
         use_vllm=not args.smoke_test,
         vllm_gpu_memory_utilization=vllm_mem,
-        # Disable pushing during training
-        push_to_hub=False,
+        push_to_hub=PUSH_TO_HUB and not args.smoke_test,
+        hub_model_id=HUB_MODEL_ID if (PUSH_TO_HUB and not args.smoke_test) else None,
     )
 
     # Build reward function
-    all_problems_map = {
-        p.get("problem_id") or p.get("question_id", ""): p
-        for p in all_problems
-    }
-    reward = make_reward_fn(all_problems_map)
+    reward = make_reward_fn()
 
     # Initialize trainer
     logger.info("Initializing GRPOTrainer...")

@@ -11,12 +11,30 @@ Usage:
 """
 
 import multiprocessing
+import multiprocessing.pool
 import os
 import sys
 from typing import Optional
 from config import EXEC_TIMEOUT as SUBPROCESS_TIMEOUT, EXEC_WORKERS as POOL_WORKERS, MAX_TEST_CASES
 
 sys.set_int_max_str_digits(100000)
+
+# ─────────────────────────────────────────
+# Persistent batch pool
+# Created once on first score_batch call, reused for all subsequent calls.
+# Avoids spawning POOL_WORKERS new processes per reward step — without this,
+# pool creation/teardown alone costs ~3s per step × 2000 steps ≈ 1.5 hours.
+# ─────────────────────────────────────────
+_batch_pool: Optional["multiprocessing.pool.Pool"] = None
+
+
+def _get_batch_pool(n_workers: int) -> multiprocessing.pool.Pool:
+    """Return the module-level persistent spawn pool, creating it on first call."""
+    global _batch_pool
+    if _batch_pool is None:
+        ctx = multiprocessing.get_context("spawn")
+        _batch_pool = ctx.Pool(processes=n_workers)
+    return _batch_pool
 
 
 # ─────────────────────────────────────────
@@ -226,9 +244,15 @@ def score_batch(
 
     args = [(code, problem, timeout) for code, problem in zip(codes, problems)]
 
-    # use spawn context for pool to avoid nested fork issues
-    ctx = multiprocessing.get_context("spawn")
-    with ctx.Pool(processes=n_workers) as pool:
+    # Use persistent pool — created once, reused across all training steps
+    global _batch_pool
+    try:
+        pool = _get_batch_pool(n_workers)
+        results = pool.map(_pool_worker_wrapper, args)
+    except Exception:
+        # Pool may have died (worker crash etc); recreate once and retry
+        _batch_pool = None
+        pool = _get_batch_pool(n_workers)
         results = pool.map(_pool_worker_wrapper, args)
 
     scores = [r[0] for r in results]

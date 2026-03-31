@@ -37,6 +37,7 @@ from config import (
     HARD_GEMINI_WEIGHT, HARD_PRESENCE_WEIGHT,
     # Misc
     GROUP_SIZE,
+    MAX_NEW_TOKENS,
     normalize_difficulty,
 )
 from reward.execution import score_batch as exec_score_batch, extract_code, score_single
@@ -45,6 +46,8 @@ logger = logging.getLogger(__name__)
 
 # Dataset coverage tracking
 _seen_problem_ids: set[str] = set()
+_seen_by_source: dict = {"apps": set(), "lcb_seen": set()}
+_seen_by_diff: dict = {"easy": set(), "medium": set(), "hard": set()}
 
 
 # ---------------------------------------------------------------------------
@@ -125,10 +128,14 @@ def reward_fn(
     ]
 
     # Track dataset coverage
-    for p in problems:
+    for p, src, diff in zip(problems, sources, difficulties):
         pid = p.get("problem_id") or p.get("question_id", "")
         if pid:
-            _seen_problem_ids.add(str(pid))
+            pid_str = str(pid)
+            _seen_problem_ids.add(pid_str)
+            src_key = "lcb_seen" if src in ("lcb", "lcb_seen") else "apps"
+            _seen_by_source.setdefault(src_key, set()).add(pid_str)
+            _seen_by_diff.setdefault(diff, set()).add(pid_str)
 
     # ------------------------------------------------------------------
     # Step 1: Extract code and think blocks
@@ -149,6 +156,8 @@ def reward_fn(
             "mean_score": sum(exec_scores) / len(exec_scores) if exec_scores else 0,
             "zero_scores": sum(1 for s in exec_scores if s == 0.0),
             "perfect_scores": sum(1 for s in exec_scores if s == 1.0),
+            "timeout_count": 0,
+            "timeout_fraction": 0.0,
         }
 
     # ------------------------------------------------------------------
@@ -223,7 +232,7 @@ def reward_fn(
     # ------------------------------------------------------------------
     _log_metrics(
         final_rewards, exec_scores, presence_scores, gemini_scores,
-        reasoning_scores, difficulties, think_blocks, codes, completions, exec_stats,
+        reasoning_scores, difficulties, sources, think_blocks, codes, completions, exec_stats,
     )
 
     return final_rewards
@@ -231,7 +240,7 @@ def reward_fn(
 
 def _log_metrics(
     rewards, exec_scores, presence_scores, gemini_scores,
-    reasoning_scores, difficulties, think_blocks, codes, completions, exec_stats,
+    reasoning_scores, difficulties, sources, think_blocks, codes, completions, exec_stats,
 ):
     """Log comprehensive metrics to WandB and emit console warnings on threshold breaches."""
     try:
@@ -261,8 +270,22 @@ def _log_metrics(
             "gen/valid_code_fraction": sum(1 for c in codes if c) / n,
             "gen/has_reasoning_fraction": sum(1 for t in think_blocks if t) / n,
             "gen/empty_completion_fraction": sum(1 for c in completions if not c.strip()) / n,
+            # Completion length (chars; ~4 chars per token as rough proxy)
+            # Watch these over training: think_chars should grow (more reasoning),
+            # truncated_fraction should stay near 0 (if high, increase MAX_NEW_TOKENS)
+            "gen/mean_completion_chars": float(np.mean([len(c) for c in completions])),
+            "gen/mean_think_chars": float(np.mean([len(t) for t in think_blocks])),
+            "gen/mean_code_chars": float(np.mean([len(c) for c in codes if c])) if any(codes) else 0.0,
+            "gen/likely_truncated_fraction": sum(
+                1 for c in completions if len(c) > MAX_NEW_TOKENS * 4 * 0.9
+            ) / n,
             # Dataset coverage
             "data/unique_problems_seen": len(_seen_problem_ids),
+            "data/apps_seen": len(_seen_by_source.get("apps", set())),
+            "data/lcb_seen": len(_seen_by_source.get("lcb_seen", set())),
+            "data/easy_seen": len(_seen_by_diff.get("easy", set())),
+            "data/medium_seen": len(_seen_by_diff.get("medium", set())),
+            "data/hard_seen": len(_seen_by_diff.get("hard", set())),
         }
 
         # Per-difficulty breakdown
@@ -272,6 +295,17 @@ def _log_metrics(
                 log_dict[f"reward/mean_{diff_name}"] = reward_arr[mask].mean()
                 log_dict[f"reward/execution_{diff_name}"] = exec_arr[mask].mean()
                 log_dict[f"reward/reasoning_{diff_name}"] = reasoning_arr[mask].mean()
+
+        # Per-source reward breakdown
+        source_arr = np.array(sources)
+        apps_mask = source_arr == "apps"
+        lcb_mask = (source_arr == "lcb_seen") | (source_arr == "lcb")
+        if apps_mask.sum() > 0:
+            log_dict["reward/apps_mean"] = reward_arr[apps_mask].mean()
+            log_dict["exec/apps_mean"] = exec_arr[apps_mask].mean()
+        if lcb_mask.sum() > 0:
+            log_dict["reward/lcb_mean"] = reward_arr[lcb_mask].mean()
+            log_dict["exec/lcb_mean"] = exec_arr[lcb_mask].mean()
 
         # Gemini stats
         gemini_called = [i for i in range(n) if gemini_scores[i] is not None]

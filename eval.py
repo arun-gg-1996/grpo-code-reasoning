@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime
 
 sys.set_int_max_str_digits(0)  # APPS data contains very large integers in JSON fields
 
@@ -38,7 +39,7 @@ from config import (
     MAX_NEW_TOKENS,
     normalize_difficulty,
 )
-from reward.execution import score_single, extract_code
+from reward.execution import score_batch as exec_score_batch, extract_code
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -166,52 +167,60 @@ def evaluate(
     k_values: list[int],
 ) -> dict:
     """
-    Evaluate solutions against test cases.
-    Returns pass@k scores per difficulty and overall.
+    Evaluate solutions against test cases using parallel batch scoring.
+    Returns pass@k scores broken down by: overall, difficulty, and platform.
     """
-    results_by_diff = {"easy": [], "medium": [], "hard": [], "all": []}
+    # Flatten all (code, problem) pairs for a single parallel batch call.
+    flat_codes: list[str] = []
+    flat_problems: list[dict] = []
+    for p in problems:
+        pid = p.get("question_id") or p.get("problem_id", "unknown")
+        for code in solutions.get(pid, []):
+            flat_codes.append(code or "")
+            flat_problems.append(p)
 
-    for p in tqdm(problems, desc="Evaluating"):
+    if flat_codes:
+        logger.info(f"Scoring {len(flat_codes)} completions in parallel...")
+        all_scores, _ = exec_score_batch(codes=flat_codes, problems=flat_problems)
+    else:
+        all_scores = []
+
+    # Reconstruct per-problem (n, c) — tracked by difficulty and platform
+    buckets: dict[str, list[dict]] = {
+        "all": [],
+        "easy": [], "medium": [], "hard": [],
+        "leetcode": [], "atcoder": [],
+    }
+    idx = 0
+    for p in tqdm(problems, desc="Aggregating results"):
         pid = p.get("question_id") or p.get("problem_id", "unknown")
         diff = p.get("difficulty", "medium")
+        platform = p.get("platform", "unknown").lower()
         codes = solutions.get(pid, [])
-
-        if not codes:
-            for k in k_values:
-                results_by_diff[diff].append({"n": 0, "c": 0})
-                results_by_diff["all"].append({"n": 0, "c": 0})
-            continue
-
-        # Score each generation
         n = len(codes)
-        c = 0
-        for code in codes:
-            if not code:
-                continue
-            score = score_single(code, p)
-            if score >= 0.99:  # full pass
-                c += 1
+        c = sum(1 for s in all_scores[idx:idx + n] if s >= 0.99)
+        idx += n
+        if n > 0:
+            entry = {"n": n, "c": c}
+            buckets["all"].append(entry)
+            if diff in buckets:
+                buckets[diff].append(entry)
+            if platform in buckets:
+                buckets[platform].append(entry)
 
-        results_by_diff[diff].append({"n": n, "c": c})
-        results_by_diff["all"].append({"n": n, "c": c})
-
-    # Compute pass@k
+    # Compute pass@k for each bucket
     metrics = {}
-    for diff, entries in results_by_diff.items():
-        valid_entries = [e for e in entries if e["n"] > 0]
-        if not valid_entries:
-            continue
-
+    counts = {}
+    for bucket_name, entries in buckets.items():
+        valid = [e for e in entries if e["n"] > 0]
+        counts[bucket_name] = len(valid)
         for k in k_values:
-            scores = [
-                pass_at_k(e["n"], e["c"], k)
-                for e in valid_entries
-                if e["n"] >= k
-            ]
-            if scores:
-                metrics[f"pass@{k}_{diff}"] = np.mean(scores)
+            eligible = [e for e in valid if e["n"] >= k]
+            if eligible:
+                scores = [pass_at_k(e["n"], e["c"], k) for e in eligible]
+                metrics[f"pass@{k}/{bucket_name}"] = round(float(np.mean(scores)), 4)
 
-    return metrics
+    return metrics, counts
 
 
 # ---------------------------------------------------------------------------
@@ -253,21 +262,45 @@ def main():
     )
 
     # Evaluate
-    metrics = evaluate(problems, solutions, args.k_values)
+    metrics, counts = evaluate(problems, solutions, args.k_values)
 
-    # Print results
-    logger.info("=" * 60)
-    logger.info("EVALUATION RESULTS")
-    logger.info("=" * 60)
-    for key, val in sorted(metrics.items()):
-        logger.info(f"  {key}: {val:.4f}")
-    logger.info("=" * 60)
+    # Pretty-print results table
+    k_vals = sorted(set(int(k.split("@")[1].split("/")[0]) for k in metrics))
+    splits = [
+        ("Overall",   "all"),
+        ("Easy",      "easy"),
+        ("Medium",    "medium"),
+        ("Hard",      "hard"),
+        ("LeetCode",  "leetcode"),
+        ("AtCoder",   "atcoder"),
+    ]
 
-    # Save results
+    header = f"{'Split':<12} {'Problems':>9}" + "".join(f"  {'pass@'+str(k):>8}" for k in k_vals)
+    sep = "-" * len(header)
+    print(f"\n{'=' * len(header)}")
+    print(f"  EVALUATION RESULTS — {args.model}")
+    print(f"{'=' * len(header)}")
+    print(header)
+    print(sep)
+    for label, key in splits:
+        n = counts.get(key, 0)
+        if n == 0:
+            continue
+        row = f"{label:<12} {n:>9}"
+        for k in k_vals:
+            val = metrics.get(f"pass@{k}/{key}")
+            row += f"  {val:>8.4f}" if val is not None else f"  {'—':>8}"
+        print(row)
+    print(f"{'=' * len(header)}\n")
+
+    # Save results — auto-create output directory
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     output = {
         "model": args.model,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "n_problems": len(problems),
         "n_generations": args.n_generations,
+        "problem_counts": counts,
         "metrics": metrics,
     }
     with open(args.output, "w") as f:

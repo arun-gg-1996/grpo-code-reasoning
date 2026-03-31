@@ -35,6 +35,7 @@ outputs/
 *.bin
 
 # Eval results
+results/
 eval_results.json
 baseline_results.json
 final_results.json

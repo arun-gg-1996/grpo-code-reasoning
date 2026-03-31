@@ -11,6 +11,8 @@ Usage:
 import sys
 import os
 
+sys.set_int_max_str_digits(0)  # APPS data contains integers with 9000+ digits
+
 # Ensure project root is on path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -25,10 +27,10 @@ def test_imports():
         APPS_EXEC_WEIGHT, APPS_REASONING_WEIGHT,
         LCB_EXEC_WEIGHT, LCB_REASONING_WEIGHT,
         EASY_GEMINI_WEIGHT, MEDIUM_GEMINI_WEIGHT, HARD_GEMINI_WEIGHT,
-        VERTEX_PROJECT, VERTEX_REGION, JUDGE_MODEL,
+        JUDGE_MODEL, MAX_NEW_TOKENS,
         normalize_difficulty, get_curriculum_weights,
     )
-    print(f"  config: OK (APPS exec={APPS_EXEC_WEIGHT}, LCB exec={LCB_EXEC_WEIGHT})")
+    print(f"  config: OK (APPS exec={APPS_EXEC_WEIGHT}, LCB exec={LCB_EXEC_WEIGHT}, MAX_NEW_TOKENS={MAX_NEW_TOKENS})")
 
     import sandbox
     print("  sandbox: OK")
