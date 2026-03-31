@@ -19,7 +19,9 @@ JUDGE_MODEL = "gemini-2.5-flash-lite"
 import os
 from dotenv import load_dotenv
 load_dotenv()
-GEMINI_API_KEY = os.environ.get("api_key", "")
+# Primary key name in .env is gemini_api_key.
+# Keep api_key as backward-compatible fallback.
+GEMINI_API_KEY = os.environ.get("gemini_api_key", os.environ.get("api_key", ""))
 
 # ─────────────────────────────────────────
 # GRPO hyperparameters
@@ -238,4 +240,3 @@ REASONING_SYSTEM_PROMPT = JUDGE_SYSTEM_PROMPT
 JUDGE_TIMEOUT = GEMINI_TIMEOUT
 JUDGE_TEMPERATURE = 0.0
 JUDGE_MAX_TOKENS = GEMINI_MAX_TOKENS
-

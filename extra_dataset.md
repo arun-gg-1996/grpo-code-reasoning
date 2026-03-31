@@ -10,9 +10,9 @@ Average 2.3 test cases across all difficulties — too noisy for reliable execut
 ## Why it's worth revisiting
 With our per-source reward weighting design, we can include it with upweighted reasoning:
 ```
-CodeContests: 0.55 exec + 0.35 reasoning + 0.10 similarity
+CodeContests: 0.55 exec + 0.45 reasoning
 ```
-Same treatment as LCB with reference solution. Compensates for noisy execution with stronger reasoning signal.
+Same treatment style as LCB source weighting. Compensates for noisy execution with stronger reasoning signal.
 
 ## What it adds
 ~5k additional problems, skewing toward medium/hard difficulty.
@@ -20,8 +20,8 @@ Directly addresses the main weakness: only ~500-600 hard problems in current dat
 
 ## What it needs before inclusion
 - Same sandbox compat check as LCB (lcb_sandbox_compat_check.py pattern)
-- Claude API solution enrichment for similarity score reference
-- Claude API reference reasoning generation
+- Optional Gemini calibration sample on CodeContests-style reasoning traces
+- Optional prompt tuning if CodeContests language differs materially from APPS/LCB
 
 ## Estimated cost to enrich
 ~$10-15 for 5k problems via Claude Haiku.

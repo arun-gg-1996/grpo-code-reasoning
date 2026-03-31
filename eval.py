@@ -142,17 +142,26 @@ def generate_solutions(
         prompts.append(prompt)
         problem_ids.append(pid)
 
-    # Generate in batches
-    logger.info(f"Generating {n_generations} solutions for {len(problems)} problems...")
-    all_outputs = llm.generate(prompts, sampling_params)
-
     results = {}
-    for pid, output in zip(problem_ids, all_outputs):
-        codes = []
-        for gen in output.outputs:
-            code = extract_code(gen.text)
-            codes.append(code or "")
-        results[pid] = codes
+    total = len(prompts)
+    logger.info(
+        f"Generating {n_generations} solutions for {total} problems "
+        f"(batch_size={batch_size})..."
+    )
+
+    # Generate in user-configured mini-batches to control memory/throughput.
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        batch_prompts = prompts[start:end]
+        batch_ids = problem_ids[start:end]
+
+        batch_outputs = llm.generate(batch_prompts, sampling_params)
+        for pid, output in zip(batch_ids, batch_outputs):
+            codes = []
+            for gen in output.outputs:
+                code = extract_code(gen.text)
+                codes.append(code or "")
+            results[pid] = codes
 
     return results
 

@@ -11,29 +11,31 @@ Usage:
 """
 
 import multiprocessing
-import multiprocessing.pool
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from config import EXEC_TIMEOUT as SUBPROCESS_TIMEOUT, EXEC_WORKERS as POOL_WORKERS, MAX_TEST_CASES
 
 sys.set_int_max_str_digits(100000)
 
 # ─────────────────────────────────────────
-# Persistent batch pool
-# Created once on first score_batch call, reused for all subsequent calls.
-# Avoids spawning POOL_WORKERS new processes per reward step — without this,
-# pool creation/teardown alone costs ~3s per step × 2000 steps ≈ 1.5 hours.
+# Persistent thread pool for batch scoring.
+# Each thread launches an isolated subprocess via _run_subprocess.
+# This avoids daemon process nesting errors from multiprocessing.Pool workers.
 # ─────────────────────────────────────────
-_batch_pool: Optional["multiprocessing.pool.Pool"] = None
+_batch_pool: Optional[ThreadPoolExecutor] = None
+_batch_pool_workers: Optional[int] = None
 
 
-def _get_batch_pool(n_workers: int) -> multiprocessing.pool.Pool:
-    """Return the module-level persistent spawn pool, creating it on first call."""
-    global _batch_pool
-    if _batch_pool is None:
-        ctx = multiprocessing.get_context("spawn")
-        _batch_pool = ctx.Pool(processes=n_workers)
+def _get_batch_pool(n_workers: int) -> ThreadPoolExecutor:
+    """Return the module-level persistent thread pool, creating it on first call."""
+    global _batch_pool, _batch_pool_workers
+    if _batch_pool is None or _batch_pool_workers != n_workers:
+        if _batch_pool is not None:
+            _batch_pool.shutdown(wait=True, cancel_futures=False)
+        _batch_pool = ThreadPoolExecutor(max_workers=n_workers)
+        _batch_pool_workers = n_workers
     return _batch_pool
 
 
@@ -244,16 +246,17 @@ def score_batch(
 
     args = [(code, problem, timeout) for code, problem in zip(codes, problems)]
 
-    # Use persistent pool — created once, reused across all training steps
+    # Use persistent thread pool — each task still executes user code in
+    # its own subprocess via _run_subprocess, preserving isolation.
     global _batch_pool
     try:
         pool = _get_batch_pool(n_workers)
-        results = pool.map(_pool_worker_wrapper, args)
+        results = list(pool.map(_pool_worker_wrapper, args))
     except Exception:
-        # Pool may have died (worker crash etc); recreate once and retry
+        # Pool may have died; recreate once and retry
         _batch_pool = None
         pool = _get_batch_pool(n_workers)
-        results = pool.map(_pool_worker_wrapper, args)
+        results = list(pool.map(_pool_worker_wrapper, args))
 
     scores = [r[0] for r in results]
     statuses = [r[1] for r in results]

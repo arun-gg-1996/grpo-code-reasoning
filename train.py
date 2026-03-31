@@ -18,6 +18,7 @@ import logging
 import random
 import sys
 import os
+import time
 
 sys.set_int_max_str_digits(0)  # APPS data contains very large integers in JSON fields
 
@@ -65,6 +66,16 @@ from reward.reward import reward_fn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+try:
+    import pynvml
+except ImportError:
+    pynvml = None
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +206,165 @@ def make_reward_fn():
 
 
 # ---------------------------------------------------------------------------
+# Timed trainer wrapper (step timing + system metrics for wandb)
+# ---------------------------------------------------------------------------
+
+def _bytes_to_gb(n_bytes: float) -> float:
+    return float(n_bytes) / (1024 ** 3)
+
+
+class TimedGRPOTrainer(GRPOTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._phase_timing = {
+            "timing/generation_s": 0.0,
+            "timing/reward_calc_s": 0.0,
+            "timing/loss_compute_s": 0.0,
+            "timing/training_step_s": 0.0,
+        }
+        self._step_wall_start = time.perf_counter()
+        self._process = psutil.Process(os.getpid()) if psutil is not None else None
+        self._model_param_bytes = self._estimate_model_param_bytes()
+        self._nvml_handle = None
+        self._nvml_ready = False
+        if torch.cuda.is_available() and pynvml is not None:
+            try:
+                pynvml.nvmlInit()
+                self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                self._nvml_ready = True
+            except Exception:
+                self._nvml_ready = False
+
+    def _estimate_model_param_bytes(self) -> float:
+        total = 0
+        for p in self.model.parameters():
+            total += p.numel() * p.element_size()
+        return float(total)
+
+    def _estimate_optimizer_state_bytes(self) -> float | None:
+        if getattr(self, "optimizer", None) is None:
+            return None
+        total = 0
+        for state in self.optimizer.state.values():
+            for v in state.values():
+                if torch.is_tensor(v):
+                    total += v.numel() * v.element_size()
+        return float(total)
+
+    def _collect_system_metrics(self) -> dict:
+        metrics = {}
+        if self._process is not None:
+            try:
+                metrics["system/cpu_percent"] = float(self._process.cpu_percent(interval=None))
+                rss = float(self._process.memory_info().rss)
+                metrics["system/process_rss_gb"] = _bytes_to_gb(rss)
+                vm = psutil.virtual_memory()
+                metrics["system/ram_used_gb"] = _bytes_to_gb(float(vm.used))
+                metrics["system/ram_percent"] = float(vm.percent)
+            except Exception:
+                pass
+
+        if torch.cuda.is_available():
+            try:
+                allocated = float(torch.cuda.memory_allocated())
+                reserved = float(torch.cuda.memory_reserved())
+                metrics["gpu/torch_allocated_gb"] = _bytes_to_gb(allocated)
+                metrics["gpu/torch_reserved_gb"] = _bytes_to_gb(reserved)
+                metrics["gpu/torch_max_allocated_gb"] = _bytes_to_gb(float(torch.cuda.max_memory_allocated()))
+                metrics["gpu/torch_max_reserved_gb"] = _bytes_to_gb(float(torch.cuda.max_memory_reserved()))
+            except Exception:
+                pass
+
+            if self._nvml_ready and self._nvml_handle is not None:
+                try:
+                    util = pynvml.nvmlDeviceGetUtilizationRates(self._nvml_handle)
+                    mem = pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
+                    metrics["gpu/utilization_percent"] = float(util.gpu)
+                    metrics["gpu/nvml_mem_used_gb"] = _bytes_to_gb(float(mem.used))
+                    metrics["gpu/nvml_mem_total_gb"] = _bytes_to_gb(float(mem.total))
+                    # Approximate memory not tracked by torch (e.g., vLLM/runtime allocations)
+                    if "gpu/torch_reserved_gb" in metrics:
+                        metrics["gpu/non_torch_mem_gb_est"] = max(
+                            0.0,
+                            metrics["gpu/nvml_mem_used_gb"] - metrics["gpu/torch_reserved_gb"],
+                        )
+                except Exception:
+                    pass
+
+        return metrics
+
+    def _flush_step_metrics(self):
+        if wandb is None or wandb.run is None:
+            self._phase_timing = {k: 0.0 for k in self._phase_timing}
+            self._step_wall_start = time.perf_counter()
+            return
+
+        step_total_s = time.perf_counter() - self._step_wall_start
+        log_dict = {
+            "timing/step_total_s": float(step_total_s),
+            **{k: float(v) for k, v in self._phase_timing.items()},
+            "gpu/model_param_gb_est": _bytes_to_gb(self._model_param_bytes),
+        }
+
+        opt_bytes = self._estimate_optimizer_state_bytes()
+        if opt_bytes is not None:
+            log_dict["gpu/optimizer_state_gb_est"] = _bytes_to_gb(opt_bytes)
+
+        log_dict.update(self._collect_system_metrics())
+        wandb.log(log_dict)
+
+        self._phase_timing = {k: 0.0 for k in self._phase_timing}
+        self._step_wall_start = time.perf_counter()
+
+    def _generate(self, prompts: list):
+        t0 = time.perf_counter()
+        out = super()._generate(prompts)
+        self._phase_timing["timing/generation_s"] += time.perf_counter() - t0
+        return out
+
+    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
+        t0 = time.perf_counter()
+        out = super()._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+        self._phase_timing["timing/reward_calc_s"] += time.perf_counter() - t0
+        return out
+
+    def _compute_loss(self, model, inputs):
+        t0 = time.perf_counter()
+        out = super()._compute_loss(model, inputs)
+        self._phase_timing["timing/loss_compute_s"] += time.perf_counter() - t0
+        return out
+
+    def training_step(self, model, inputs, num_items_in_batch):
+        t0 = time.perf_counter()
+        out = super().training_step(model, inputs, num_items_in_batch)
+        self._phase_timing["timing/training_step_s"] += time.perf_counter() - t0
+        if self._step % self.current_gradient_accumulation_steps == 0:
+            self._flush_step_metrics()
+        return out
+
+    def _save_checkpoint(self, model, trial):
+        t0 = time.perf_counter()
+        out = super()._save_checkpoint(model, trial)
+        dt = time.perf_counter() - t0
+        if wandb is not None and wandb.run is not None:
+            wandb.log({
+                "event/checkpointing": 1,
+                "event/checkpoint_save_s": float(dt),
+            })
+        return out
+
+    def _push_from_checkpoint(self, checkpoint_folder: str):
+        t0 = time.perf_counter()
+        out = super()._push_from_checkpoint(checkpoint_folder)
+        dt = time.perf_counter() - t0
+        if wandb is not None and wandb.run is not None:
+            wandb.log({
+                "event/hf_push_s": float(dt),
+            })
+        return out
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -253,12 +423,9 @@ def main():
     for d, ps in problems_by_diff.items():
         logger.info(f"  {d}: {len(ps)} problems")
 
-    # Pre-build curriculum-weighted dataset.
-    # sample_batch applies get_curriculum_weights(step) at each step, so the dataset
-    # has the correct difficulty distribution across all phases baked in.
-    # Note: TRL's GRPOTrainer uses its own random sampler, so phase ordering is not
-    # preserved — but the overall distribution (more easy early, more hard later on
-    # average) is correct since the dataset is sampled from with replacement randomly.
+    # Pre-build curriculum dataset in strict step order.
+    # One row group per step, sampled with get_curriculum_weights(step).
+    # We keep this ordering at train time by setting shuffle_dataset=False below.
     logger.info("Building curriculum-weighted dataset...")
     all_sampled = []
     for step in range(max_steps):
@@ -317,6 +484,7 @@ def main():
         model_init_kwargs={"torch_dtype": "float32", "device_map": "cpu"} if args.smoke_test else None,
         use_vllm=not args.smoke_test,
         vllm_gpu_memory_utilization=vllm_mem,
+        shuffle_dataset=False,
         push_to_hub=PUSH_TO_HUB and not args.smoke_test,
         hub_model_id=HUB_MODEL_ID if (PUSH_TO_HUB and not args.smoke_test) else None,
     )
@@ -326,7 +494,7 @@ def main():
 
     # Initialize trainer
     logger.info("Initializing GRPOTrainer...")
-    trainer = GRPOTrainer(
+    trainer = TimedGRPOTrainer(
         model=model_name,
         reward_funcs=reward,
         args=training_args,

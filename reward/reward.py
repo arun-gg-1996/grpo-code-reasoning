@@ -19,6 +19,7 @@ Data flow contract (DO NOT shuffle):
 
 import re
 import logging
+import time
 
 import numpy as np
 
@@ -137,6 +138,8 @@ def reward_fn(
             _seen_by_source.setdefault(src_key, set()).add(pid_str)
             _seen_by_diff.setdefault(diff, set()).add(pid_str)
 
+    t_reward_start = time.perf_counter()
+
     # ------------------------------------------------------------------
     # Step 1: Extract code and think blocks
     # ------------------------------------------------------------------
@@ -146,11 +149,12 @@ def reward_fn(
     # ------------------------------------------------------------------
     # Step 2: Execution scoring (parallel via subprocess pool)
     # ------------------------------------------------------------------
+    t_exec_start = time.perf_counter()
     try:
         exec_scores, exec_stats = exec_score_batch(codes=codes, problems=problems)
-    except AssertionError:
-        # Fallback to sequential scoring (e.g., when called from daemon process)
-        logger.warning("score_batch failed (daemon process?), falling back to sequential")
+    except Exception:
+        # Fallback to sequential scoring if batch path fails for any reason.
+        logger.warning("score_batch failed, falling back to sequential")
         exec_scores = [score_single(c, p) for c, p in zip(codes, problems)]
         exec_stats = {
             "mean_score": sum(exec_scores) / len(exec_scores) if exec_scores else 0,
@@ -159,6 +163,7 @@ def reward_fn(
             "timeout_count": 0,
             "timeout_fraction": 0.0,
         }
+    exec_time_s = time.perf_counter() - t_exec_start
 
     # ------------------------------------------------------------------
     # Step 3: Presence heuristic for all completions
@@ -183,7 +188,9 @@ def reward_fn(
 
     gemini_scores = [None] * n  # None = not called or no think block
 
+    judge_time_s = 0.0
     if gemini_indices:
+        t_judge_start = time.perf_counter()
         try:
             from reward.judge import score_batch as judge_score_batch
             raw_scores = judge_score_batch(
@@ -195,6 +202,7 @@ def reward_fn(
                 gemini_scores[idx] = score
         except Exception as e:
             logger.warning(f"Gemini batch call failed, falling back to presence: {e}")
+        judge_time_s = time.perf_counter() - t_judge_start
 
     # ------------------------------------------------------------------
     # Step 5: Combine scores per spec
@@ -233,6 +241,11 @@ def reward_fn(
     _log_metrics(
         final_rewards, exec_scores, presence_scores, gemini_scores,
         reasoning_scores, difficulties, sources, think_blocks, codes, completions, exec_stats,
+        timing={
+            "timing/reward_total_s": time.perf_counter() - t_reward_start,
+            "timing/reward_execution_s": exec_time_s,
+            "timing/reward_judge_s": judge_time_s,
+        },
     )
 
     return final_rewards
@@ -241,6 +254,7 @@ def reward_fn(
 def _log_metrics(
     rewards, exec_scores, presence_scores, gemini_scores,
     reasoning_scores, difficulties, sources, think_blocks, codes, completions, exec_stats,
+    timing=None,
 ):
     """Log comprehensive metrics to WandB and emit console warnings on threshold breaches."""
     try:
@@ -287,6 +301,8 @@ def _log_metrics(
             "data/medium_seen": len(_seen_by_diff.get("medium", set())),
             "data/hard_seen": len(_seen_by_diff.get("hard", set())),
         }
+        if timing:
+            log_dict.update(timing)
 
         # Per-difficulty breakdown
         for diff_name in ("easy", "medium", "hard"):
@@ -313,6 +329,16 @@ def _log_metrics(
             g_scores = [gemini_scores[i] for i in gemini_called]
             log_dict["judge/gemini_mean"] = np.mean(g_scores)
             log_dict["judge/gemini_calls"] = len(gemini_called)
+            try:
+                from reward.judge import get_last_batch_stats
+                judge_stats = get_last_batch_stats()
+                log_dict["judge/total_calls"] = judge_stats.get("total_calls", 0)
+                log_dict["judge/fallback_count"] = judge_stats.get("fallback_count", 0)
+                log_dict["judge/fallback_fraction"] = judge_stats.get("fallback_fraction", 0.0)
+                log_dict["judge/step_json_count"] = judge_stats.get("step_json_count", 0)
+                log_dict["judge/step_json_fraction"] = judge_stats.get("step_json_fraction", 0.0)
+            except Exception:
+                pass
 
         # Execution zero/low split
         exec_zero_frac = (exec_arr == 0.0).mean()

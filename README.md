@@ -4,6 +4,16 @@ Fine-tunes **Qwen2.5-Coder-7B-Instruct** with GRPO on APPS + LCB problems.
 Reward signal: execution correctness + Gemini-judged reasoning quality.
 Eval: Pass@1 and Pass@3 on LiveCodeBench v4 (387 held-out problems, never seen during training).
 
+## Source of Truth
+
+To avoid doc drift, keep these as the only canonical references:
+- `config.py` — all tunable hyperparameters, prompts, weights, and paths
+- `train.py` / `eval.py` — actual runtime behavior
+- `README.md` — operator runbook
+- `METRICS.md` — plain-English glossary of custom W&B metrics
+
+`docs/project.md` and `project_desc.md` were intentionally removed because they had stale/duplicate parameter values.
+
 ---
 
 ## 1. Setup
@@ -31,7 +41,7 @@ rsync -avz data/ user@server:/path/to/GRPO/data/
 
 Create `.env` in the project root:
 ```
-api_key=YOUR_GEMINI_API_KEY
+gemini_api_key=YOUR_GEMINI_API_KEY
 ```
 Get the key from: GCP Console → API Keys → project `grpo-reasoning-2`
 
@@ -225,6 +235,8 @@ Go to [wandb.ai/arun-gv-ghontale/grpo-code-gen](https://wandb.ai/arun-gv-ghontal
 |--------|---------|---------|
 | `reward/execution_mean` | trending up | Flat = model not improving at solving problems |
 | `reward/reasoning_mean` | trending up | Flat = reasoning quality not improving |
+| `judge/fallback_fraction` | near 0 | High = Gemini calls failing/parsing fallback |
+| `judge/step_json_fraction` | near 1 | Low = Gemini not returning per-step JSON reliably |
 | `reward/mean_easy` | should rise first | — |
 | `reward/mean_medium` | rises after ~step 500 | — |
 | `reward/mean_hard` | rises after ~step 1000 | — |
@@ -256,6 +268,22 @@ Go to [wandb.ai/arun-gv-ghontale/grpo-code-gen](https://wandb.ai/arun-gv-ghontal
 | `data/easy_seen` | Grows fastest in steps 0–300 |
 | `data/medium_seen` | Accelerates from step 300 |
 | `data/hard_seen` | Accelerates from step 800 |
+
+**Timing, system, and events (new):**
+
+| Metric | What to check |
+|--------|----------------|
+| `timing/step_total_s` | overall iteration speed |
+| `timing/generation_s` | rollout generation time |
+| `timing/reward_execution_s` | sandbox scoring time inside reward |
+| `timing/reward_judge_s` | Gemini scoring time inside reward |
+| `gpu/utilization_percent` | GPU compute saturation |
+| `gpu/nvml_mem_used_gb` | total GPU memory in use |
+| `gpu/non_torch_mem_gb_est` | rough non-PyTorch memory (vLLM/runtime) |
+| `system/ram_percent` | host RAM pressure |
+| `event/checkpointing` | checkpoint pulse marker |
+| `event/checkpoint_save_s` | checkpoint save duration |
+| `event/hf_push_s` | Hugging Face push duration |
 
 **Early warnings** fire automatically as console logs and wandb alerts when thresholds are breached. Binary `warn/*` flags are also plotted per step so you can see exactly when issues started.
 
