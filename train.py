@@ -383,7 +383,14 @@ def main():
         save_steps = 999
         vllm_mem = 0.3
         use_wandb = False
+        smoke_use_gpu = torch.cuda.is_available()
+        smoke_use_vllm = smoke_use_gpu
         logger.info("=== SMOKE TEST MODE ===")
+        logger.info(
+            "Smoke test device: %s | vLLM: %s",
+            "cuda" if smoke_use_gpu else "cpu",
+            "enabled" if smoke_use_vllm else "disabled",
+        )
     else:
         model_name = TRAINING_MODEL
         max_steps = MAX_TRAINING_STEPS
@@ -479,10 +486,14 @@ def main():
         logging_steps=LOGGING_STEPS,
         save_steps=save_steps,
         report_to="wandb" if use_wandb else "none",
-        bf16=not args.smoke_test,
-        use_cpu=args.smoke_test,
-        model_init_kwargs={"torch_dtype": "float32", "device_map": "cpu"} if args.smoke_test else None,
-        use_vllm=not args.smoke_test,
+        bf16=(not args.smoke_test) or (args.smoke_test and smoke_use_gpu),
+        use_cpu=args.smoke_test and (not smoke_use_gpu),
+        model_init_kwargs=(
+            {"torch_dtype": "float32", "device_map": "cpu"}
+            if (args.smoke_test and (not smoke_use_gpu))
+            else None
+        ),
+        use_vllm=(not args.smoke_test) or (args.smoke_test and smoke_use_vllm),
         vllm_gpu_memory_utilization=vllm_mem,
         shuffle_dataset=False,
         push_to_hub=PUSH_TO_HUB and not args.smoke_test,
