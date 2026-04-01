@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# One-shot setup for a fresh GPU server with persistent disk.
-# - Creates/uses project directory on persistent storage
+# One-shot setup for a fresh Ubuntu GPU server.
+# - Installs required system packages
+# - Creates/uses project directory
 # - Clones repo (or updates if already present)
-# - Creates venv and installs requirements
+# - Creates venv with Python 3.10+ and installs requirements
 # - Prompts for W&B / HF / Gemini keys (optional)
 #
 # Usage examples:
@@ -15,13 +16,68 @@ set -euo pipefail
 PERSIST_ROOT="${PERSIST_ROOT:-/mnt/persist}"
 PROJECT_DIR="${PROJECT_DIR:-$PERSIST_ROOT/grpo-code-reasoning}"
 REPO_URL="${REPO_URL:-}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+PYTHON_BIN="${PYTHON_BIN:-}"
 VENV_DIR="${VENV_DIR:-$PROJECT_DIR/venv}"
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+ensure_system_deps() {
+  local missing=()
+  need_cmd git || missing+=("git")
+  need_cmd python3 || missing+=("python3")
+  need_cmd python3-venv || true  # this binary may not exist even when module exists
+  if ! python3 -c "import venv" >/dev/null 2>&1; then
+    missing+=("python3-venv")
+  fi
+  need_cmd pip3 || missing+=("python3-pip")
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "Installing system packages: ${missing[*]}"
+    if need_cmd sudo; then
+      sudo apt-get update
+      sudo apt-get install -y "${missing[@]}"
+    else
+      apt-get update
+      apt-get install -y "${missing[@]}"
+    fi
+  fi
+}
+
+select_python() {
+  if [[ -n "$PYTHON_BIN" ]]; then
+    echo "$PYTHON_BIN"
+    return
+  fi
+  for p in python3.12 python3.11 python3.10 python3; do
+    if need_cmd "$p"; then
+      echo "$p"
+      return
+    fi
+  done
+  echo "python3"
+}
+
+check_python_version() {
+  local py="$1"
+  "$py" - <<'PY'
+import sys
+major, minor = sys.version_info[:2]
+if (major, minor) < (3, 10):
+    raise SystemExit("ERROR: Python 3.10+ is required.")
+print(f"Using Python {major}.{minor}")
+PY
+}
 
 echo "=== GRPO Server Setup ==="
 echo "PERSIST_ROOT: $PERSIST_ROOT"
 echo "PROJECT_DIR : $PROJECT_DIR"
 echo
+
+ensure_system_deps
+PYTHON_BIN="$(select_python)"
+check_python_version "$PYTHON_BIN"
 
 if [[ ! -d "$PERSIST_ROOT" ]]; then
   echo "ERROR: $PERSIST_ROOT does not exist."
@@ -100,6 +156,7 @@ echo
 echo "=== Setup Complete ==="
 echo "Project: $PROJECT_DIR"
 echo "Venv   : $VENV_DIR"
+echo "Python : $PYTHON_BIN"
 echo
 echo "Next commands:"
 cat <<'EOF'
@@ -110,4 +167,3 @@ python eval.py --model Qwen/Qwen2.5-Coder-7B-Instruct --save-debug-details
 # then training:
 python train.py
 EOF
-
