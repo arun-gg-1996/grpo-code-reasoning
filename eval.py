@@ -207,67 +207,121 @@ def evaluate(
     solutions: dict[str, list[str]],
     k_values: list[int],
     include_details: bool = False,
+    debug_output_path: str = "",
+    score_chunk_size: int = 128,
 ) -> tuple[dict, dict, list[dict]]:
     """
     Evaluate solutions against test cases using parallel batch scoring.
     Returns pass@k scores broken down by: overall, difficulty, and platform.
     """
-    # Flatten all (code, problem) pairs for a single parallel batch call.
-    flat_codes: list[str] = []
-    flat_problems: list[dict] = []
-    for p in problems:
-        pid = p.get("question_id") or p.get("problem_id", "unknown")
-        for code in solutions.get(pid, []):
-            flat_codes.append(code or "")
-            flat_problems.append(p)
-
-    if flat_codes:
-        logger.info(f"Scoring {len(flat_codes)} completions in parallel...")
-        all_scores, _ = exec_score_batch(codes=flat_codes, problems=flat_problems)
-    else:
-        all_scores = []
-
-    # Reconstruct per-problem (n, c) — tracked by difficulty and platform
-    buckets: dict[str, list[dict]] = {
-        "all": [],
-        "easy": [], "medium": [], "hard": [],
-        "leetcode": [], "atcoder": [],
-    }
-    details: list[dict] = []
-    idx = 0
-    for p in tqdm(problems, desc="Aggregating results"):
+    # Flatten all (code, problem) pairs.
+    flat_rows: list[dict] = []
+    for p_idx, p in enumerate(problems):
         pid = p.get("question_id") or p.get("problem_id", "unknown")
         diff = p.get("difficulty", "medium")
         platform = p.get("platform", "unknown").lower()
         question = p.get("question", "")
-        codes = solutions.get(pid, [])
-        n = len(codes)
-        problem_scores = all_scores[idx:idx + n]
-        c = sum(1 for s in problem_scores if s >= 0.99)
+        for completion_idx, code in enumerate(solutions.get(pid, []), start=1):
+            flat_rows.append(
+                {
+                    "problem_idx": p_idx,
+                    "question_id": pid,
+                    "difficulty": diff,
+                    "platform": platform,
+                    "problem_statement": question,
+                    "completion_index": completion_idx,
+                    "model_output": code or "",
+                    "problem_obj": p,
+                }
+            )
 
-        if include_details:
-            for completion_idx, (code, score) in enumerate(zip(codes, problem_scores), start=1):
-                details.append(
-                    {
-                        "question_id": pid,
-                        "difficulty": diff,
-                        "platform": platform,
-                        "completion_index": completion_idx,
+    total = len(flat_rows)
+    all_scores: list[float] = []
+    details: list[dict] = []
+
+    details_fh = None
+    if include_details and debug_output_path:
+        os.makedirs(os.path.dirname(os.path.abspath(debug_output_path)), exist_ok=True)
+        details_fh = open(debug_output_path, "w")
+
+    if total:
+        logger.info(
+            f"Scoring {total} completions in parallel (chunk_size={score_chunk_size})..."
+        )
+        score_start = time.time()
+        score_pbar = tqdm(total=total, desc="Scoring", unit="completion")
+
+        for start in range(0, total, score_chunk_size):
+            end = min(start + score_chunk_size, total)
+            chunk = flat_rows[start:end]
+            chunk_codes = [r["model_output"] for r in chunk]
+            chunk_problems = [r["problem_obj"] for r in chunk]
+            chunk_scores, _ = exec_score_batch(codes=chunk_codes, problems=chunk_problems)
+            all_scores.extend(chunk_scores)
+
+            if include_details:
+                for row, score in zip(chunk, chunk_scores):
+                    detail_row = {
+                        "question_id": row["question_id"],
+                        "difficulty": row["difficulty"],
+                        "platform": row["platform"],
+                        "completion_index": row["completion_index"],
                         "execution_score": float(score),
                         "is_correct": bool(score >= 0.99),
-                        "problem_statement": question,
-                        "model_output": code,
+                        "problem_statement": row["problem_statement"],
+                        "model_output": row["model_output"],
                     }
-                )
+                    if details_fh is not None:
+                        details_fh.write(json.dumps(detail_row) + "\n")
+                    else:
+                        details.append(detail_row)
 
-        idx += n
-        if n > 0:
-            entry = {"n": n, "c": c}
-            buckets["all"].append(entry)
-            if diff in buckets:
-                buckets[diff].append(entry)
-            if platform in buckets:
-                buckets[platform].append(entry)
+            score_pbar.update(end - start)
+            done = end
+            elapsed = time.time() - score_start
+            eta = ((elapsed / done) * (total - done)) if done > 0 else 0.0
+            logger.info(
+                f"Scoring progress: {done}/{total} completions | "
+                f"elapsed={_fmt_seconds(elapsed)} | eta={_fmt_seconds(eta)}"
+            )
+
+        score_pbar.close()
+
+    if details_fh is not None:
+        details_fh.close()
+
+    # Reconstruct per-problem (n, c) — tracked by difficulty and platform.
+    problem_stats: dict[int, dict] = {}
+    for row, score in zip(flat_rows, all_scores):
+        p_idx = row["problem_idx"]
+        st = problem_stats.setdefault(
+            p_idx,
+            {
+                "n": 0,
+                "c": 0,
+                "difficulty": row["difficulty"],
+                "platform": row["platform"],
+            },
+        )
+        st["n"] += 1
+        if score >= 0.99:
+            st["c"] += 1
+
+    buckets: dict[str, list[dict]] = {
+        "all": [],
+        "easy": [],
+        "medium": [],
+        "hard": [],
+        "leetcode": [],
+        "atcoder": [],
+    }
+    for st in problem_stats.values():
+        entry = {"n": st["n"], "c": st["c"]}
+        buckets["all"].append(entry)
+        if st["difficulty"] in buckets:
+            buckets[st["difficulty"]].append(entry)
+        if st["platform"] in buckets:
+            buckets[st["platform"]].append(entry)
 
     # Compute pass@k for each bucket
     metrics = {}
@@ -306,6 +360,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=MAX_NEW_TOKENS)
     parser.add_argument("--temperature", type=float, default=EVAL_TEMPERATURE)
     parser.add_argument("--k-values", type=int, nargs="+", default=EVAL_K_VALUES)
+    parser.add_argument("--score-chunk-size", type=int, default=128)
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--output", type=str, default="")
     parser.add_argument("--output-dir", type=str, default="results/eval")
@@ -329,6 +384,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     summary_path = args.output or os.path.join(args.output_dir, f"{run_name}_summary.json")
     debug_path_default = os.path.join(args.output_dir, f"{run_name}_details.jsonl")
+    debug_path = args.debug_output or debug_path_default
 
     logger.info(
         f"Eval artifacts directory: {os.path.abspath(args.output_dir)} | run_name={run_name}"
@@ -362,6 +418,8 @@ def main():
         solutions,
         args.k_values,
         include_details=args.save_debug_details,
+        debug_output_path=debug_path if args.save_debug_details else "",
+        score_chunk_size=max(1, int(args.score_chunk_size)),
     )
 
     # Pretty-print results table
@@ -410,9 +468,12 @@ def main():
     logger.info(f"Results saved to {summary_path}")
 
     if args.save_debug_details:
-        debug_path = args.debug_output or debug_path_default
-        save_eval_details_jsonl(details, debug_path)
-        logger.info(f"Debug details saved to {debug_path} ({len(details)} rows)")
+        if details:
+            # Fallback path when details were not streamed during evaluate().
+            save_eval_details_jsonl(details, debug_path)
+            logger.info(f"Debug details saved to {debug_path} ({len(details)} rows)")
+        else:
+            logger.info(f"Debug details streamed to {debug_path}")
 
 
 if __name__ == "__main__":
