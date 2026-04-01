@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Pull latest eval artifacts (summary + details) from remote server
-# into local results/eval folder.
+# Pull latest eval artifacts folder from remote server into local results/eval.
 #
 # Defaults are set for current project setup but can be overridden:
 #   REMOTE_HOST, REMOTE_USER, REMOTE_PORT, SSH_KEY, REMOTE_EVAL_DIR, LOCAL_EVAL_DIR
@@ -23,8 +22,8 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 Usage: $0
 
 Pull latest eval artifacts from remote:
-- latest *_summary.json
-- matching *_details.jsonl (if present)
+- latest timestamp run folder under REMOTE_EVAL_DIR
+- pulls summary.json and details.jsonl (if present)
 
 Config via env vars:
   REMOTE_HOST     (default: $REMOTE_HOST)
@@ -48,27 +47,31 @@ SSH_BASE=(ssh -i "$SSH_KEY" -p "$REMOTE_PORT")
 SCP_BASE=(scp -i "$SSH_KEY" -P "$REMOTE_PORT")
 REMOTE="${REMOTE_USER}@${REMOTE_HOST}"
 
-latest_summary="$("${SSH_BASE[@]}" "$REMOTE" "ls -1t '${REMOTE_EVAL_DIR}'/*_summary.json 2>/dev/null | head -n 1" || true)"
+latest_run_dir="$("${SSH_BASE[@]}" "$REMOTE" "ls -1dt '${REMOTE_EVAL_DIR}'/*/ 2>/dev/null | head -n 1" || true)"
 
-if [[ -z "$latest_summary" ]]; then
-  echo "No summary file found in ${REMOTE}:${REMOTE_EVAL_DIR}"
+if [[ -z "$latest_run_dir" ]]; then
+  echo "No run directory found in ${REMOTE}:${REMOTE_EVAL_DIR}"
   exit 1
 fi
 
-latest_details="${latest_summary%_summary.json}_details.jsonl"
-run_base="$(basename "${latest_summary%_summary.json}")"
+latest_run_dir="${latest_run_dir%/}"
+run_base="$(basename "$latest_run_dir")"
+remote_summary="${latest_run_dir}/summary.json"
+remote_details="${latest_run_dir}/details.jsonl"
+local_run_dir="${LOCAL_EVAL_DIR}/${run_base}"
+mkdir -p "$local_run_dir"
 
-echo "Latest run: $run_base"
-echo "Pulling summary -> $LOCAL_EVAL_DIR/"
-"${SCP_BASE[@]}" "$REMOTE:$latest_summary" "$LOCAL_EVAL_DIR/"
+echo "Latest run directory: $run_base"
+echo "Pulling summary -> $local_run_dir/"
+"${SCP_BASE[@]}" "$REMOTE:$remote_summary" "$local_run_dir/"
 
-if "${SSH_BASE[@]}" "$REMOTE" "test -f '$latest_details'"; then
-  echo "Pulling details -> $LOCAL_EVAL_DIR/"
-  "${SCP_BASE[@]}" "$REMOTE:$latest_details" "$LOCAL_EVAL_DIR/"
+if "${SSH_BASE[@]}" "$REMOTE" "test -f '$remote_details'"; then
+  echo "Pulling details -> $local_run_dir/"
+  "${SCP_BASE[@]}" "$REMOTE:$remote_details" "$local_run_dir/"
 else
   echo "No matching details file found for latest run (this is normal if --save-debug-details was not used)."
 fi
 
 echo "Done. Local files:"
-ls -lh "$LOCAL_EVAL_DIR"/"${run_base}"_summary.json "$LOCAL_EVAL_DIR"/"${run_base}"_details.jsonl 2>/dev/null || \
-  ls -lh "$LOCAL_EVAL_DIR"/"${run_base}"_summary.json
+ls -lh "${local_run_dir}/summary.json" "${local_run_dir}/details.jsonl" 2>/dev/null || \
+  ls -lh "${local_run_dir}/summary.json"

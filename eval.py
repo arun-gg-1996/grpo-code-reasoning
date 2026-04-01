@@ -362,32 +362,22 @@ def main():
     parser.add_argument("--k-values", type=int, nargs="+", default=EVAL_K_VALUES)
     parser.add_argument("--score-chunk-size", type=int, default=128)
     parser.add_argument("--smoke-test", action="store_true")
-    parser.add_argument("--output", type=str, default="")
     parser.add_argument("--output-dir", type=str, default="results/eval")
-    parser.add_argument("--run-name", type=str, default="")
     parser.add_argument(
         "--save-debug-details",
         action="store_true",
         help="Save per-completion debug JSONL (problem statement, model output, execution score)",
     )
-    parser.add_argument(
-        "--debug-output",
-        type=str,
-        default="",
-        help="Path for debug JSONL; default is results/eval/<timestamp_model>_details.jsonl",
-    )
     args = parser.parse_args()
 
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_slug = _slugify_model_name(args.model)
-    run_name = args.run_name or f"{run_ts}_{model_slug}"
-    os.makedirs(args.output_dir, exist_ok=True)
-    summary_path = args.output or os.path.join(args.output_dir, f"{run_name}_summary.json")
-    debug_path_default = os.path.join(args.output_dir, f"{run_name}_details.jsonl")
-    debug_path = args.debug_output or debug_path_default
+    run_dir = os.path.join(args.output_dir, run_ts)
+    os.makedirs(run_dir, exist_ok=True)
+    summary_path = os.path.join(run_dir, "summary.json")
+    debug_path = os.path.join(run_dir, "details.jsonl")
 
     logger.info(
-        f"Eval artifacts directory: {os.path.abspath(args.output_dir)} | run_name={run_name}"
+        f"Eval artifacts directory: {os.path.abspath(run_dir)}"
     )
 
     # Load problems
@@ -402,28 +392,152 @@ def main():
 
     eval_start = time.time()
 
-    # Generate solutions
-    solutions = generate_solutions(
-        model_path=args.model,
-        problems=problems,
-        n_generations=args.n_generations,
-        batch_size=args.batch_size,
-        max_tokens=args.max_tokens,
+    # Streaming eval: generate -> score -> write debug rows per batch.
+    from vllm import LLM, SamplingParams
+
+    logger.info(f"Loading model: {args.model}")
+    llm = LLM(model=args.model, trust_remote_code=True)
+    sampling_params = SamplingParams(
         temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        n=args.n_generations,
     )
 
-    # Evaluate
-    metrics, counts, details = evaluate(
-        problems,
-        solutions,
-        args.k_values,
-        include_details=args.save_debug_details,
-        debug_output_path=debug_path if args.save_debug_details else "",
-        score_chunk_size=max(1, int(args.score_chunk_size)),
-    )
+    problem_rows: list[dict] = []
+    prompts: list[str] = []
+    for p in problems:
+        pid = p.get("question_id") or p.get("problem_id", "unknown")
+        question = p.get("question", "")
+        is_lc = p.get("is_leetcode", False)
+        if is_lc:
+            prompt = f"{EVAL_SYSTEM_PROMPT_LEETCODE}\n\n{question}"
+            starter = p.get("starter_code", "")
+            if starter:
+                prompt += f"\n\n{starter}"
+        else:
+            prompt = f"{EVAL_SYSTEM_PROMPT_STDIO}\n\n{question}"
+
+        prompts.append(prompt)
+        problem_rows.append(
+            {
+                "question_id": pid,
+                "difficulty": p.get("difficulty", "medium"),
+                "platform": p.get("platform", "unknown").lower(),
+                "problem_statement": question,
+                "problem_obj": p,
+                "n": args.n_generations,
+                "c": 0,
+            }
+        )
+
+    debug_fh = None
+    if args.save_debug_details:
+        os.makedirs(os.path.dirname(os.path.abspath(debug_path)), exist_ok=True)
+        debug_fh = open(debug_path, "w")
+        logger.info(f"Streaming debug details to {debug_path}")
+
+    total_prompts = len(prompts)
+    total_completions = total_prompts * args.n_generations
+    gen_done = 0
+    score_done = 0
+    gen_start = time.time()
+    score_start = time.time()
+    gen_pbar = tqdm(total=total_prompts, desc="Generating", unit="prompt")
+    score_pbar = tqdm(total=total_completions, desc="Scoring", unit="completion")
+
+    for start in range(0, total_prompts, args.batch_size):
+        end = min(start + args.batch_size, total_prompts)
+        batch_prompts = prompts[start:end]
+        batch_rows = problem_rows[start:end]
+
+        batch_outputs = llm.generate(batch_prompts, sampling_params)
+
+        # Score each problem's n generations immediately.
+        for row, output in zip(batch_rows, batch_outputs):
+            codes = [extract_code(gen.text) or "" for gen in output.outputs]
+            chunk_scores, _ = exec_score_batch(
+                codes=codes,
+                problems=[row["problem_obj"]] * len(codes),
+            )
+            row["c"] = sum(1 for s in chunk_scores if s >= 0.99)
+
+            if debug_fh is not None:
+                for i, (code, score) in enumerate(zip(codes, chunk_scores), start=1):
+                    debug_fh.write(
+                        json.dumps(
+                            {
+                                "question_id": row["question_id"],
+                                "difficulty": row["difficulty"],
+                                "platform": row["platform"],
+                                "completion_index": i,
+                                "execution_score": float(score),
+                                "is_correct": bool(score >= 0.99),
+                                "problem_statement": row["problem_statement"],
+                                "model_output": code,
+                            }
+                        )
+                        + "\n"
+                    )
+                debug_fh.flush()
+
+            score_done += len(codes)
+            score_pbar.update(len(codes))
+
+        gen_done += (end - start)
+        gen_pbar.update(end - start)
+
+        gen_elapsed = time.time() - gen_start
+        gen_eta = ((gen_elapsed / gen_done) * (total_prompts - gen_done)) if gen_done > 0 else 0.0
+        logger.info(
+            f"Generation progress: {gen_done}/{total_prompts} prompts | "
+            f"elapsed={_fmt_seconds(gen_elapsed)} | eta={_fmt_seconds(gen_eta)}"
+        )
+
+        score_elapsed = time.time() - score_start
+        score_eta = (
+            (score_elapsed / score_done) * (total_completions - score_done)
+            if score_done > 0 else 0.0
+        )
+        logger.info(
+            f"Scoring progress: {score_done}/{total_completions} completions | "
+            f"elapsed={_fmt_seconds(score_elapsed)} | eta={_fmt_seconds(score_eta)}"
+        )
+
+    gen_pbar.close()
+    score_pbar.close()
+    if debug_fh is not None:
+        debug_fh.close()
+
+    # Aggregate pass@k metrics from per-problem counts.
+    buckets: dict[str, list[dict]] = {
+        "all": [],
+        "easy": [],
+        "medium": [],
+        "hard": [],
+        "leetcode": [],
+        "atcoder": [],
+    }
+    for row in problem_rows:
+        entry = {"n": int(row["n"]), "c": int(row["c"])}
+        buckets["all"].append(entry)
+        if row["difficulty"] in buckets:
+            buckets[row["difficulty"]].append(entry)
+        if row["platform"] in buckets:
+            buckets[row["platform"]].append(entry)
+
+    metrics = {}
+    counts = {}
+    for bucket_name, entries in buckets.items():
+        valid = [e for e in entries if e["n"] > 0]
+        counts[bucket_name] = len(valid)
+        for k in args.k_values:
+            eligible = [e for e in valid if e["n"] >= k]
+            if eligible:
+                scores = [pass_at_k(e["n"], e["c"], k) for e in eligible]
+                metrics[f"pass@{k}/{bucket_name}"] = round(float(np.mean(scores)), 4)
 
     # Pretty-print results table
-    k_vals = sorted(set(int(k.split("@")[1].split("/")[0]) for k in metrics))
+    k_vals = sorted(set(args.k_values))
     splits = [
         ("Overall",   "all"),
         ("Easy",      "easy"),
@@ -456,7 +570,7 @@ def main():
     output = {
         "model": args.model,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "run_name": run_name,
+        "run_dir": os.path.abspath(run_dir),
         "n_problems": len(problems),
         "n_generations": args.n_generations,
         "problem_counts": counts,
@@ -468,12 +582,7 @@ def main():
     logger.info(f"Results saved to {summary_path}")
 
     if args.save_debug_details:
-        if details:
-            # Fallback path when details were not streamed during evaluate().
-            save_eval_details_jsonl(details, debug_path)
-            logger.info(f"Debug details saved to {debug_path} ({len(details)} rows)")
-        else:
-            logger.info(f"Debug details streamed to {debug_path}")
+        logger.info(f"Debug details streamed to {debug_path}")
 
 
 if __name__ == "__main__":
