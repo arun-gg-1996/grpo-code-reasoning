@@ -10,7 +10,7 @@ set -euo pipefail
 #   ./scripts/pull_latest_eval.sh
 #   REMOTE_HOST=1.2.3.4 SSH_KEY=~/.ssh/my_key ./scripts/pull_latest_eval.sh
 
-REMOTE_HOST="${REMOTE_HOST:-95.216.229.231}"
+REMOTE_HOST="${REMOTE_HOST:-216.81.248.189}"
 REMOTE_USER="${REMOTE_USER:-root}"
 REMOTE_PORT="${REMOTE_PORT:-22}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/primeintellect_ed25519}"

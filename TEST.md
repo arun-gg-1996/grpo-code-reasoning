@@ -61,13 +61,69 @@ python train.py --smoke-test
 
 This validates GRPOTrainer wiring with a tiny local run.
 
-## 6. Baseline Eval Before Full Training
+## 6. Sandbox Stress Test (recommended before long eval/train)
 
+Quick:
 ```bash
-python eval.py --model Qwen/Qwen2.5-Coder-7B-Instruct --output results/baseline_results.json
+python scripts/stress_execution.py \
+  --rounds-clean 10 \
+  --rounds-mixed 5 \
+  --batch-size 32 \
+  --workers 16 \
+  --timeout 5
 ```
 
-## 7. Start Full Training
+Heavier:
+```bash
+python scripts/stress_execution.py \
+  --rounds-clean 30 \
+  --rounds-mixed 10 \
+  --batch-size 32 \
+  --workers 16 \
+  --timeout 5
+```
+
+## 7. Baseline Eval Before Full Training
+
+```bash
+python eval.py --model Qwen/Qwen2.5-Coder-7B-Instruct --save-debug-details
+```
+
+Notes:
+- Eval artifacts are auto-saved to a timestamped folder:
+  `results/eval/<YYYYMMDD_HHMMSS>/`
+- Files:
+  - `summary.json`
+  - `details.jsonl` (raw per-completion rows)
+
+Live tail while eval runs:
+
+```bash
+latest=$(ls -1dt results/eval/*/ | head -n 1)
+tail -f "${latest}details.jsonl"
+```
+
+Verify new execution aggregates exist after eval:
+
+```bash
+python - <<'PY'
+import json,glob
+p=sorted(glob.glob("results/eval/*/summary.json"))[-1]
+d=json.load(open(p))
+print("summary:", p)
+print("has execution_metrics:", "execution_metrics" in d)
+for k in sorted(d.get("execution_metrics",{}).keys()):
+    print(k, "=", d["execution_metrics"][k])
+PY
+```
+
+Pull latest eval folder from server to local machine:
+
+```bash
+bash scripts/pull_latest_eval.sh
+```
+
+## 8. Start Full Training
 
 ```bash
 python train.py
@@ -75,7 +131,7 @@ python train.py
 
 Monitor in W&B using the project configured in `config.py`.
 
-## 8. Verify Checkpointing + HF Push (during real training)
+## 9. Verify Checkpointing + HF Push (during real training)
 
 Run these checks after training starts:
 
