@@ -442,6 +442,7 @@ def main():
                 "problem_obj": p,
                 "n": args.n_generations,
                 "c": 0,
+                "scores": [],
             }
         )
 
@@ -489,6 +490,7 @@ def main():
                             chunk_scores[i] = float(rs)
 
             row["c"] = sum(1 for s in chunk_scores if s >= 0.99)
+            row["scores"] = [float(s) for s in chunk_scores]
 
             if debug_fh is not None:
                 for i, (code, score) in enumerate(zip(codes, chunk_scores), start=1):
@@ -550,6 +552,35 @@ def main():
                 scores = [pass_at_k(e["n"], e["c"], k) for e in eligible]
                 metrics[f"pass@{k}/{bucket_name}"] = round(float(np.mean(scores)), 4)
 
+    # Aggregate execution-score metrics (test-case pass fraction) by bucket.
+    exec_scores_by_bucket: dict[str, list[float]] = {
+        "overall": [],
+        "easy": [],
+        "medium": [],
+        "hard": [],
+        "leetcode": [],
+        "atcoder": [],
+    }
+    for row in problem_rows:
+        row_scores = row.get("scores", []) or []
+        if not row_scores:
+            continue
+        diff = row.get("difficulty", "unknown")
+        plat = row.get("platform", "unknown")
+        exec_scores_by_bucket["overall"].extend(row_scores)
+        if diff in exec_scores_by_bucket:
+            exec_scores_by_bucket[diff].extend(row_scores)
+        if plat in exec_scores_by_bucket:
+            exec_scores_by_bucket[plat].extend(row_scores)
+
+    exec_metrics: dict[str, float] = {}
+    for bucket_name, vals in exec_scores_by_bucket.items():
+        if not vals:
+            continue
+        arr = np.array(vals, dtype=float)
+        exec_metrics[f"exec_mean/{bucket_name}"] = round(float(arr.mean()), 4)
+        exec_metrics[f"exec_nonzero_frac/{bucket_name}"] = round(float(np.mean(arr > 0.0)), 4)
+
     # Pretty-print results table
     k_vals = sorted(set(args.k_values))
     splits = [
@@ -593,6 +624,7 @@ def main():
         "recovered_zero_count": int(recovered_zeros),
         "problem_counts": counts,
         "metrics": metrics,
+        "execution_metrics": exec_metrics,
         "runtime_s": round(time.time() - eval_start, 2),
     }
     with open(summary_path, "w") as f:
