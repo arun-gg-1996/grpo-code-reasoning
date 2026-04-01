@@ -136,6 +136,7 @@ bash scripts/pull_latest_eval.sh
 ## 8. Start Full Training
 
 ```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python train.py
 ```
 
