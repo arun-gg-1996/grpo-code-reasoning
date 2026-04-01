@@ -124,7 +124,25 @@ def load_problems(path: str, source_label: str) -> list[dict]:
 def build_prompt(problem: dict) -> str:
     """Build the training prompt for a problem."""
     question = problem.get("question", "")
-    return f"{TRAINING_SYSTEM_PROMPT}\n\n{question}"
+    is_lc_func = bool(problem.get("is_leetcode") and problem.get("func_name"))
+
+    if is_lc_func:
+        format_hint = (
+            "Output format requirement:\n"
+            "- This is a function-style problem.\n"
+            "- In <code>...</code>, provide only the function/class implementation expected by the prompt.\n"
+            "- Do NOT read from stdin and do NOT print to stdout unless explicitly required by the statement.\n"
+            "- Inside <code>, output raw Python only (no triple backticks)."
+        )
+    else:
+        format_hint = (
+            "Output format requirement:\n"
+            "- This is a stdin/stdout problem.\n"
+            "- In <code>...</code>, provide a full program that reads input from stdin and prints output.\n"
+            "- Inside <code>, output raw Python only (no triple backticks)."
+        )
+
+    return f"{TRAINING_SYSTEM_PROMPT}\n\n{format_hint}\n\n{question}"
 
 
 def sample_batch(

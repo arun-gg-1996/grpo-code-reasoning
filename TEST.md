@@ -133,11 +133,23 @@ Pull latest eval folder from server to local machine:
 bash scripts/pull_latest_eval.sh
 ```
 
+Regression check for fence sanitization using real training completions:
+
+```bash
+python scripts/test_fence_sanitization.py
+```
+
 ## 8. Start Full Training
 
 ```bash
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-python train.py
+python train.py --save-debug-details
+```
+
+Pull latest training debug artifacts from server to local machine:
+
+```bash
+bash scripts/pull_latest_train.sh
 ```
 
 Monitor in W&B using the project configured in `config.py`.
@@ -186,4 +198,3 @@ In W&B, confirm event metrics appear:
 - `event/checkpointing`
 - `event/checkpoint_save_s`
 - `event/hf_push_s`
-

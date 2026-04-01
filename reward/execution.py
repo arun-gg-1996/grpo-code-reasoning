@@ -66,15 +66,27 @@ def _stdio_worker(solution: str, test_cases: list, result_queue):
         result_queue.put(("error", str(e)))
 
 
-def _parse_functional_input(input_str: str) -> list:
+def _parse_functional_input(input_obj) -> list:
     """
-    Parse a functional test input string into a list of Python arguments.
+    Parse functional-test input into a list of Python call arguments.
     Handles two formats:
       - Single-line: '["a", "b"]'   → [["a", "b"]]   (one list argument)
       - Multi-line:  '[1,2]\n[3,4]' → [[1,2], [3,4]] (two arguments)
+      - Already-typed input:
+          - list/tuple -> treated as argument list
+          - scalar/dict -> treated as single argument
     """
     import ast, json as _json
-    lines = [l.strip() for l in input_str.strip().split("\n") if l.strip()]
+
+    # Already-typed APPS inputs (common in function-style tasks).
+    if not isinstance(input_obj, str):
+        if isinstance(input_obj, tuple):
+            return list(input_obj)
+        if isinstance(input_obj, list):
+            return input_obj
+        return [input_obj]
+
+    lines = [l.strip() for l in input_obj.strip().split("\n") if l.strip()]
     args = []
     for line in lines:
         try:
@@ -87,10 +99,14 @@ def _parse_functional_input(input_str: str) -> list:
     return args
 
 
-def _parse_functional_output(output_str: str):
-    """Parse a functional test output string into a Python object."""
+def _parse_functional_output(output_obj):
+    """Parse functional-test expected output into a Python object."""
     import ast, json as _json
-    s = output_str.strip()
+
+    if not isinstance(output_obj, str):
+        return output_obj
+
+    s = output_obj.strip()
     try:
         return _json.loads(s)
     except Exception:
@@ -106,11 +122,20 @@ def _functional_worker(solution: str, func_name: str, test_cases: list, result_q
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         from sandbox.testing_util import run_test
 
-        io_payload = {
-            "inputs": [_parse_functional_input(tc["input"]) for tc in test_cases],
-            "outputs": [_parse_functional_output(tc["output"]) for tc in test_cases],
-            "fn_name": func_name,
-        }
+        parsed_inputs = []
+        parsed_outputs = []
+        for tc in test_cases:
+            if isinstance(tc, dict):
+                in_obj = tc.get("input")
+                out_obj = tc.get("output")
+            else:
+                # Fallback for tuple/list test-case rows.
+                in_obj = tc[0] if isinstance(tc, (list, tuple)) and len(tc) > 0 else tc
+                out_obj = tc[1] if isinstance(tc, (list, tuple)) and len(tc) > 1 else None
+            parsed_inputs.append(_parse_functional_input(in_obj))
+            parsed_outputs.append(_parse_functional_output(out_obj))
+
+        io_payload = {"inputs": parsed_inputs, "outputs": parsed_outputs, "fn_name": func_name}
         # Suppress verbose checker prints (failed checks, runtime traces) from child process.
         with open(os.devnull, "w") as devnull:
             with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
@@ -171,9 +196,10 @@ def score_single(
     test_cases = test_cases[:MAX_TEST_CASES]
 
     is_lc = problem.get("is_leetcode", False)
-    func_name = problem.get("func_name", "")
+    func_name = problem.get("func_name", "") or problem.get("fn_name", "")
+    is_function_style = bool(func_name and (is_lc or ("fn_name" in problem) or problem.get("functional_tests")))
 
-    if is_lc and func_name:
+    if is_function_style:
         status, result = _run_subprocess(
             _functional_worker,
             (code, func_name, problem.get("functional_tests", test_cases)),
@@ -208,9 +234,10 @@ def _pool_worker_wrapper(args):
 
     test_cases = test_cases[:MAX_TEST_CASES]
     is_lc = problem.get("is_leetcode", False)
-    func_name = problem.get("func_name", "")
+    func_name = problem.get("func_name", "") or problem.get("fn_name", "")
+    is_function_style = bool(func_name and (is_lc or ("fn_name" in problem) or problem.get("functional_tests")))
 
-    if is_lc and func_name:
+    if is_function_style:
         status, result = _run_subprocess(
             _functional_worker,
             (code, func_name, problem.get("functional_tests", test_cases)),
@@ -291,15 +318,46 @@ def extract_code(response: str) -> Optional[str]:
     Returns None if no code block found.
     """
     import re
+    def _strip_markdown_fences(code_text: str) -> str:
+        """
+        Remove wrapping markdown fences if the extracted code still includes them.
+        Handles:
+          ```python
+          ...
+          ```
+        and:
+          ```
+          ...
+          ```
+        """
+        text = code_text.strip()
+        # If a fenced block appears anywhere inside, prefer its content.
+        # This covers malformed cases where extra text leaks before the real fenced code.
+        fenced_anywhere = re.findall(r"```(?:python)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+        if fenced_anywhere:
+            return fenced_anywhere[-1].strip()
+
+        if not text.startswith("```"):
+            return text
+
+        lines = text.splitlines()
+        if len(lines) >= 2 and lines[0].strip().startswith("```"):
+            # Drop opening fence line.
+            lines = lines[1:]
+            # Drop trailing fence line if present.
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+        return "\n".join(lines).strip()
+
     match = re.search(r"<code>(.*?)</code>", response, re.DOTALL)
     if match:
-        return match.group(1).strip()
+        return _strip_markdown_fences(match.group(1))
     # fallback: ```python blocks
     match = re.search(r"```python\s*(.*?)```", response, re.DOTALL)
     if match:
-        return match.group(1).strip()
+        return _strip_markdown_fences(match.group(1))
     # fallback: any ``` block
     match = re.search(r"```\s*(.*?)```", response, re.DOTALL)
     if match:
-        return match.group(1).strip()
+        return _strip_markdown_fences(match.group(1))
     return None

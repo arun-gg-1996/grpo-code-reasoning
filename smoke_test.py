@@ -59,7 +59,7 @@ def test_config_logic():
     print("  normalize_difficulty: OK")
 
     w0 = get_curriculum_weights(0)
-    assert w0["easy"] == 0.8
+    assert w0["easy"] == 0.9
     w800 = get_curriculum_weights(800)
     assert w800["hard"] == 0.2
     print("  get_curriculum_weights: OK")
@@ -74,6 +74,7 @@ def test_extraction():
     # Code extraction
     assert extract_code("<code>print(1)</code>") == "print(1)"
     assert extract_code("```python\nprint(2)\n```") == "print(2)"
+    assert extract_code("<code>```python\nprint(3)\n```</code>") == "print(3)"
     assert extract_code("no code here") is None
     print("  extract_code: OK")
 
@@ -306,6 +307,34 @@ def test_data_loading():
             break
 
 
+def test_prompt_format_hints():
+    """Verify prompt includes interface-specific format guidance."""
+    print("\n--- Testing prompt format hints ---")
+    from train import build_prompt
+
+    stdio_problem = {
+        "question": "Read n and print n",
+        "source": "apps",
+        "is_leetcode": False,
+        "func_name": None,
+    }
+    p_stdio = build_prompt(stdio_problem)
+    assert "stdin/stdout problem" in p_stdio
+    assert "no triple backticks" in p_stdio
+
+    func_problem = {
+        "question": "Implement function foo",
+        "source": "lcb_seen",
+        "is_leetcode": True,
+        "func_name": "foo",
+    }
+    p_func = build_prompt(func_problem)
+    assert "function-style problem" in p_func
+    assert "Do NOT read from stdin" in p_func
+    assert "no triple backticks" in p_func
+    print("  build_prompt format hints: OK")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("GRPO SMOKE TEST")
@@ -320,6 +349,7 @@ if __name__ == "__main__":
         test_execution_sandbox()
         test_reward_fn_easy()
         test_data_loading()
+        test_prompt_format_hints()
 
         print("\n" + "=" * 60)
         print("ALL SMOKE TESTS PASSED")
