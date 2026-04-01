@@ -57,8 +57,9 @@ def _stdio_worker(solution: str, test_cases: list, result_queue):
             "outputs": [tc["output"] for tc in test_cases],
         }
         # Suppress verbose checker prints (failed checks, runtime traces) from child process.
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            results = run_test(problem={"input_output": io_payload}, test=solution)
+        with open(os.devnull, "w") as devnull:
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                results = run_test(problem={"input_output": io_payload}, test=solution)
         score = sum(1 for r in results if r is True) / len(results) if results else 0.0
         result_queue.put(("ok", score))
     except Exception as e:
@@ -111,8 +112,9 @@ def _functional_worker(solution: str, func_name: str, test_cases: list, result_q
             "fn_name": func_name,
         }
         # Suppress verbose checker prints (failed checks, runtime traces) from child process.
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            results = run_test(problem={"input_output": io_payload}, test=solution)
+        with open(os.devnull, "w") as devnull:
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                results = run_test(problem={"input_output": io_payload}, test=solution)
         score = sum(1 for r in results if r is True) / len(results) if results else 0.0
         result_queue.put(("ok", score))
     except Exception as e:
