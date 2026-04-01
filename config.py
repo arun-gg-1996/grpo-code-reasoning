@@ -109,7 +109,7 @@ EXEC_WORKERS = SANDBOX_MAX_WORKERS
 
 SAVE_STEPS = 200
 PUSH_TO_HUB = True
-HUB_MODEL_ID = "arun-gv-ghontale/grpo-qwen-coder"
+HUB_MODEL_ID = "arun-ghontale/grpo-qwen-coder"
 LOGGING_STEPS = 1  # log every step — only ~2000 steps total, want full resolution
 WANDB_PROJECT = "grpo-code-gen"
 
