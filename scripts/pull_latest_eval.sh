@@ -62,16 +62,29 @@ local_run_dir="${LOCAL_EVAL_DIR}/${run_base}"
 mkdir -p "$local_run_dir"
 
 echo "Latest run directory: $run_base"
-echo "Pulling summary -> $local_run_dir/"
-"${SCP_BASE[@]}" "$REMOTE:$remote_summary" "$local_run_dir/"
+pulled_any=0
+
+if "${SSH_BASE[@]}" "$REMOTE" "test -f '$remote_summary'"; then
+  echo "Pulling summary -> $local_run_dir/"
+  "${SCP_BASE[@]}" "$REMOTE:$remote_summary" "$local_run_dir/"
+  pulled_any=1
+else
+  echo "summary.json not found yet (normal while eval is still running)."
+fi
 
 if "${SSH_BASE[@]}" "$REMOTE" "test -f '$remote_details'"; then
   echo "Pulling details -> $local_run_dir/"
   "${SCP_BASE[@]}" "$REMOTE:$remote_details" "$local_run_dir/"
+  pulled_any=1
 else
-  echo "No matching details file found for latest run (this is normal if --save-debug-details was not used)."
+  echo "details.jsonl not found yet (or --save-debug-details was not used)."
+fi
+
+if [[ "$pulled_any" -eq 0 ]]; then
+  echo "No files available yet in latest run folder. Try again in a minute."
+  exit 0
 fi
 
 echo "Done. Local files:"
 ls -lh "${local_run_dir}/summary.json" "${local_run_dir}/details.jsonl" 2>/dev/null || \
-  ls -lh "${local_run_dir}/summary.json"
+  ls -lh "${local_run_dir}/summary.json" "${local_run_dir}/details.jsonl" 2>/dev/null || true

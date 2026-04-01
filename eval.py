@@ -39,12 +39,15 @@ from config import (
     EVAL_N_GENERATIONS,
     EVAL_K_VALUES,
     MAX_NEW_TOKENS,
+    EXEC_TIMEOUT,
     normalize_difficulty,
 )
-from reward.execution import score_batch as exec_score_batch, extract_code
+from reward.execution import score_batch as exec_score_batch, score_single, extract_code
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+logging.getLogger("vllm").setLevel(logging.WARNING)
+os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
 
 
 def _slugify_model_name(model: str) -> str:
@@ -361,6 +364,18 @@ def main():
     parser.add_argument("--temperature", type=float, default=EVAL_TEMPERATURE)
     parser.add_argument("--k-values", type=int, nargs="+", default=EVAL_K_VALUES)
     parser.add_argument("--score-chunk-size", type=int, default=128)
+    parser.add_argument(
+        "--retry-zero-scores",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Retry each non-empty completion that scored 0.0 once and keep max(score, retry_score)",
+    )
+    parser.add_argument(
+        "--retry-timeout",
+        type=int,
+        default=EXEC_TIMEOUT,
+        help="Timeout (seconds) for zero-score retry executions",
+    )
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--output-dir", type=str, default="results/eval")
     parser.add_argument(
@@ -440,8 +455,8 @@ def main():
     total_completions = total_prompts * args.n_generations
     gen_done = 0
     score_done = 0
-    gen_start = time.time()
-    score_start = time.time()
+    retried_zeros = 0
+    recovered_zeros = 0
     gen_pbar = tqdm(total=total_prompts, desc="Generating", unit="prompt")
     score_pbar = tqdm(total=total_completions, desc="Scoring", unit="completion")
 
@@ -459,6 +474,20 @@ def main():
                 codes=codes,
                 problems=[row["problem_obj"]] * len(codes),
             )
+            retry_scores: list[float | None] = [None] * len(codes)
+            retry_flags: list[bool] = [False] * len(codes)
+
+            if args.retry_zero_scores:
+                for i, (code, score) in enumerate(zip(codes, chunk_scores)):
+                    if score == 0.0 and code.strip():
+                        retry_flags[i] = True
+                        retried_zeros += 1
+                        rs = score_single(code, row["problem_obj"], timeout=args.retry_timeout)
+                        retry_scores[i] = float(rs)
+                        if rs > score:
+                            recovered_zeros += 1
+                            chunk_scores[i] = float(rs)
+
             row["c"] = sum(1 for s in chunk_scores if s >= 0.99)
 
             if debug_fh is not None:
@@ -472,6 +501,8 @@ def main():
                                 "completion_index": i,
                                 "execution_score": float(score),
                                 "is_correct": bool(score >= 0.99),
+                                "retried_zero": retry_flags[i - 1],
+                                "retry_score": retry_scores[i - 1],
                                 "problem_statement": row["problem_statement"],
                                 "model_output": code,
                             }
@@ -485,23 +516,6 @@ def main():
 
         gen_done += (end - start)
         gen_pbar.update(end - start)
-
-        gen_elapsed = time.time() - gen_start
-        gen_eta = ((gen_elapsed / gen_done) * (total_prompts - gen_done)) if gen_done > 0 else 0.0
-        logger.info(
-            f"Generation progress: {gen_done}/{total_prompts} prompts | "
-            f"elapsed={_fmt_seconds(gen_elapsed)} | eta={_fmt_seconds(gen_eta)}"
-        )
-
-        score_elapsed = time.time() - score_start
-        score_eta = (
-            (score_elapsed / score_done) * (total_completions - score_done)
-            if score_done > 0 else 0.0
-        )
-        logger.info(
-            f"Scoring progress: {score_done}/{total_completions} completions | "
-            f"elapsed={_fmt_seconds(score_elapsed)} | eta={_fmt_seconds(score_eta)}"
-        )
 
     gen_pbar.close()
     score_pbar.close()
@@ -573,6 +587,10 @@ def main():
         "run_dir": os.path.abspath(run_dir),
         "n_problems": len(problems),
         "n_generations": args.n_generations,
+        "retry_zero_scores_enabled": bool(args.retry_zero_scores),
+        "retry_timeout_s": int(args.retry_timeout),
+        "retried_zero_count": int(retried_zeros),
+        "recovered_zero_count": int(recovered_zeros),
         "problem_counts": counts,
         "metrics": metrics,
         "runtime_s": round(time.time() - eval_start, 2),
@@ -583,6 +601,10 @@ def main():
 
     if args.save_debug_details:
         logger.info(f"Debug details streamed to {debug_path}")
+    if args.retry_zero_scores:
+        logger.info(
+            f"Zero-score retry summary: retried={retried_zeros}, recovered={recovered_zeros}"
+        )
 
 
 if __name__ == "__main__":

@@ -13,6 +13,8 @@ Usage:
 import multiprocessing
 import os
 import sys
+import io
+import contextlib
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from config import EXEC_TIMEOUT as SUBPROCESS_TIMEOUT, EXEC_WORKERS as POOL_WORKERS, MAX_TEST_CASES
@@ -50,11 +52,13 @@ def _stdio_worker(solution: str, test_cases: list, result_queue):
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         from sandbox.testing_util import run_test
 
-        io = {
+        io_payload = {
             "inputs": [tc["input"] for tc in test_cases],
             "outputs": [tc["output"] for tc in test_cases],
         }
-        results = run_test(problem={"input_output": io}, test=solution)
+        # Suppress verbose checker prints (failed checks, runtime traces) from child process.
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            results = run_test(problem={"input_output": io_payload}, test=solution)
         score = sum(1 for r in results if r is True) / len(results) if results else 0.0
         result_queue.put(("ok", score))
     except Exception as e:
@@ -101,12 +105,14 @@ def _functional_worker(solution: str, func_name: str, test_cases: list, result_q
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         from sandbox.testing_util import run_test
 
-        io = {
+        io_payload = {
             "inputs": [_parse_functional_input(tc["input"]) for tc in test_cases],
             "outputs": [_parse_functional_output(tc["output"]) for tc in test_cases],
             "fn_name": func_name,
         }
-        results = run_test(problem={"input_output": io}, test=solution)
+        # Suppress verbose checker prints (failed checks, runtime traces) from child process.
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            results = run_test(problem={"input_output": io_payload}, test=solution)
         score = sum(1 for r in results if r is True) / len(results) if results else 0.0
         result_queue.put(("ok", score))
     except Exception as e:
