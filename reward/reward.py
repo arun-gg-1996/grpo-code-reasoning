@@ -20,6 +20,9 @@ Data flow contract (DO NOT shuffle):
 import re
 import logging
 import time
+import os
+import json
+from datetime import datetime
 
 import numpy as np
 
@@ -49,6 +52,13 @@ logger = logging.getLogger(__name__)
 _seen_problem_ids: set[str] = set()
 _seen_by_source: dict = {"apps": set(), "lcb_seen": set()}
 _seen_by_diff: dict = {"easy": set(), "medium": set(), "hard": set()}
+
+# Optional per-completion training debug stream (JSONL).
+_train_debug_inited = False
+_train_debug_enabled = False
+_train_debug_path = ""
+_train_debug_fh = None
+_train_debug_call_idx = 0
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +248,20 @@ def reward_fn(
     # ------------------------------------------------------------------
     # Step 6: WandB logging
     # ------------------------------------------------------------------
+    _log_train_debug_rows(
+        rewards=final_rewards,
+        exec_scores=exec_scores,
+        presence_scores=presence_scores,
+        gemini_scores=gemini_scores,
+        reasoning_scores=reasoning_scores,
+        difficulties=difficulties,
+        sources=sources,
+        problems=problems,
+        prompts=prompts,
+        codes=codes,
+        completions=completions,
+    )
+
     _log_metrics(
         final_rewards, exec_scores, presence_scores, gemini_scores,
         reasoning_scores, difficulties, sources, think_blocks, codes, completions, exec_stats,
@@ -249,6 +273,81 @@ def reward_fn(
     )
 
     return final_rewards
+
+
+def _init_train_debug_logger() -> None:
+    """Lazy-init JSONL debug file handle for per-completion training traces."""
+    global _train_debug_inited, _train_debug_enabled, _train_debug_path, _train_debug_fh
+    if _train_debug_inited:
+        return
+    _train_debug_inited = True
+
+    enabled_raw = os.environ.get("TRAIN_SAVE_DEBUG_DETAILS", "0").strip().lower()
+    _train_debug_enabled = enabled_raw in ("1", "true", "yes", "on")
+    _train_debug_path = os.environ.get("TRAIN_DEBUG_DETAILS_PATH", "").strip()
+    if not _train_debug_enabled or not _train_debug_path:
+        _train_debug_enabled = False
+        return
+
+    os.makedirs(os.path.dirname(os.path.abspath(_train_debug_path)), exist_ok=True)
+    _train_debug_fh = open(_train_debug_path, "a", buffering=1)
+    logger.info(f"Streaming training completion details to {_train_debug_path}")
+
+
+def _log_train_debug_rows(
+    rewards: list[float],
+    exec_scores: list[float],
+    presence_scores: list[float],
+    gemini_scores: list[float | None],
+    reasoning_scores: list[float],
+    difficulties: list[str],
+    sources: list[str],
+    problems: list[dict],
+    prompts: list[str],
+    codes: list[str],
+    completions: list[str],
+) -> None:
+    """Append one JSONL row per completion for post-hoc debugging."""
+    global _train_debug_call_idx
+    try:
+        _init_train_debug_logger()
+        if not _train_debug_enabled or _train_debug_fh is None:
+            return
+
+        _train_debug_call_idx += 1
+        call_idx = _train_debug_call_idx
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for i in range(len(completions)):
+            p = problems[i] if i < len(problems) else {}
+            row = {
+                "timestamp": ts,
+                "reward_call_index": call_idx,
+                "completion_index_in_call": i,
+                "problem_batch_index": i // GROUP_SIZE,
+                "rollout_index": i % GROUP_SIZE,
+                "problem_id": p.get("problem_id"),
+                "question_id": p.get("question_id"),
+                "difficulty": difficulties[i] if i < len(difficulties) else "unknown",
+                "source": sources[i] if i < len(sources) else "unknown",
+                "execution_score": float(exec_scores[i]) if i < len(exec_scores) else 0.0,
+                "presence_score": float(presence_scores[i]) if i < len(presence_scores) else 0.0,
+                "gemini_score": (
+                    None if i >= len(gemini_scores) or gemini_scores[i] is None
+                    else float(gemini_scores[i])
+                ),
+                "reasoning_score": float(reasoning_scores[i]) if i < len(reasoning_scores) else 0.0,
+                "final_reward": float(rewards[i]) if i < len(rewards) else 0.0,
+                "prompt": prompts[i] if i < len(prompts) else "",
+                "problem_statement": p.get("question", ""),
+                "extracted_code": codes[i] if i < len(codes) else "",
+                "completion_text": completions[i],
+                "has_code_block": bool(codes[i].strip()) if i < len(codes) else False,
+            }
+            _train_debug_fh.write(json.dumps(row) + "\n")
+        _train_debug_fh.flush()
+    except Exception as e:
+        logger.warning(f"Failed to write training debug rows: {e}")
 
 
 def _log_metrics(

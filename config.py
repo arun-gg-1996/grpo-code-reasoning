@@ -30,7 +30,7 @@ GEMINI_API_KEY = os.environ.get("gemini_api_key", os.environ.get("api_key", ""))
 G = 8  # rollouts per problem (GROUP_SIZE alias below)
 GROUP_SIZE = G  # alias — used throughout reward.py and logging
 BATCH_SIZE = 2  # problems per training step → 2 * 8 = 16 completions per step
-ROLLOUT_TEMPERATURE = 0.8
+ROLLOUT_TEMPERATURE = 0.3
 EVAL_TEMPERATURE = 0.2
 MAX_NEW_TOKENS = 2048
 MAX_PROMPT_LENGTH = 1024
@@ -129,7 +129,7 @@ EVAL_K_VALUES = [1, 3]  # pass@1 is primary metric, pass@3 for completeness
 CURRICULUM = [
     # Phase 0: easy only — model learns format, [STEP] blocks, basic reward signal
     (0, {
-        "difficulty": {"easy": 0.8, "medium": 0.2, "hard": 0.0}
+        "difficulty": {"easy": 0.9, "medium": 0.1, "hard": 0.0}
     }),
     # Phase 1: introduce medium — easy anchors reward signal while medium challenges
     (300, {

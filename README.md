@@ -259,7 +259,7 @@ Go to [wandb.ai/arun-gv-ghontale/grpo-code-gen](https://wandb.ai/arun-gv-ghontal
 |--------|---------|---------|
 | `gen/mean_think_chars` | trending up | Down = model reasoning less (collapsing) |
 | `gen/mean_code_chars` | slight upward trend | — |
-| `gen/likely_truncated_fraction` | near 0 | > 5% = hitting 8192 token cap, increase `MAX_NEW_TOKENS` |
+| `gen/likely_truncated_fraction` | near 0 | > 5% = hitting 2048 token cap, increase `MAX_NEW_TOKENS` |
 
 **Is curriculum working?**
 
@@ -391,9 +391,9 @@ GRPO/
 | Parameter | Value | Note |
 |-----------|-------|------|
 | `GROUP_SIZE` | 8 | rollouts per problem per step |
-| `BATCH_SIZE` | 4 | problems per step → 32 completions per step |
+| `BATCH_SIZE` | 2 | problems per step → 16 completions per step |
 | `MAX_TRAINING_STEPS` | 2000 | ~24–36 hrs on A100 |
-| `MAX_NEW_TOKENS` | 8192 | max generation per rollout (think + code) |
+| `MAX_NEW_TOKENS` | 2048 | max generation per rollout (think + code) |
 | `LEARNING_RATE` | 1e-6 | standard for GRPO on 7B |
 | `KL_COEFF` | 0.04 | KL penalty against reference model |
 | `LORA_RANK` | 8 | LoRA rank |

@@ -11,10 +11,10 @@ set -euo pipefail
 #   REMOTE_HOST=1.2.3.4 SSH_KEY=~/.ssh/my_key ./scripts/pull_latest_eval.sh
 
 REMOTE_HOST="${REMOTE_HOST:-216.81.248.189}"
-REMOTE_USER="${REMOTE_USER:-root}"
+REMOTE_USER="${REMOTE_USER:-ubuntu}"
 REMOTE_PORT="${REMOTE_PORT:-22}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/primeintellect_ed25519}"
-REMOTE_EVAL_DIR="${REMOTE_EVAL_DIR:-/root/grpo-code-reasoning/results/eval}"
+REMOTE_EVAL_DIR="${REMOTE_EVAL_DIR:-/home/${REMOTE_USER}/grpo-code-reasoning/results/eval}"
 LOCAL_EVAL_DIR="${LOCAL_EVAL_DIR:-results/eval}"
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then

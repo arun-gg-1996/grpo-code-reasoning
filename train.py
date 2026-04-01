@@ -19,6 +19,7 @@ import random
 import sys
 import os
 import time
+from datetime import datetime
 
 sys.set_int_max_str_digits(0)  # APPS data contains very large integers in JSON fields
 
@@ -372,6 +373,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke-test", action="store_true",
                         help="Run a quick local smoke test with 1.5B model")
+    parser.add_argument(
+        "--save-debug-details",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stream per-completion training debug rows to timestamped JSONL",
+    )
+    parser.add_argument(
+        "--train-artifacts-dir",
+        type=str,
+        default="results/train",
+        help="Base directory for timestamped training artifacts",
+    )
     args = parser.parse_args()
 
     # Smoke test overrides
@@ -399,6 +412,23 @@ def main():
         save_steps = SAVE_STEPS
         vllm_mem = VLLM_GPU_MEMORY_UTILIZATION
         use_wandb = True
+
+    # Timestamped train artifacts (similar to eval run folders)
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    train_run_dir = os.path.join(args.train_artifacts_dir, run_ts)
+    os.makedirs(train_run_dir, exist_ok=True)
+    train_debug_path = os.path.join(train_run_dir, "train_details.jsonl")
+    train_summary_path = os.path.join(train_run_dir, "summary.json")
+
+    # Expose debug path to reward_fn via environment variables.
+    if args.save_debug_details and (not args.smoke_test):
+        os.environ["TRAIN_SAVE_DEBUG_DETAILS"] = "1"
+        os.environ["TRAIN_DEBUG_DETAILS_PATH"] = train_debug_path
+        logger.info(f"Train artifacts directory: {os.path.abspath(train_run_dir)}")
+        logger.info(f"Streaming training debug details to {os.path.abspath(train_debug_path)}")
+    else:
+        os.environ["TRAIN_SAVE_DEBUG_DETAILS"] = "0"
+        os.environ.pop("TRAIN_DEBUG_DETAILS_PATH", None)
 
     # Init wandb
     if use_wandb and wandb is not None:
@@ -517,11 +547,41 @@ def main():
 
     # Train
     logger.info("Starting GRPO training...")
-    trainer.train()
+    run_summary = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "run_dir": os.path.abspath(train_run_dir),
+        "status": "running",
+        "model": model_name,
+        "max_steps": int(max_steps),
+        "batch_size": int(batch_size),
+        "group_size": int(group_size),
+        "save_debug_details": bool(args.save_debug_details and (not args.smoke_test)),
+        "train_debug_details_path": (
+            os.path.abspath(train_debug_path)
+            if (args.save_debug_details and (not args.smoke_test))
+            else None
+        ),
+    }
+    with open(train_summary_path, "w") as f:
+        json.dump(run_summary, f, indent=2)
+
+    try:
+        trainer.train()
+        run_summary["status"] = "completed"
+    except Exception as e:
+        run_summary["status"] = "failed"
+        run_summary["error"] = str(e)
+        with open(train_summary_path, "w") as f:
+            json.dump(run_summary, f, indent=2)
+        raise
 
     # Save final checkpoint
     logger.info("Saving final model...")
     trainer.save_model()
+
+    run_summary["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(train_summary_path, "w") as f:
+        json.dump(run_summary, f, indent=2)
 
     if use_wandb and wandb is not None:
         wandb.finish()
