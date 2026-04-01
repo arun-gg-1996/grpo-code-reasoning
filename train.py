@@ -486,6 +486,7 @@ def main():
         logging_steps=LOGGING_STEPS,
         save_steps=save_steps,
         report_to="wandb" if use_wandb else "none",
+        gradient_checkpointing=not args.smoke_test,
         bf16=(not args.smoke_test) or (args.smoke_test and smoke_use_gpu),
         use_cpu=args.smoke_test and (not smoke_use_gpu),
         model_init_kwargs=(

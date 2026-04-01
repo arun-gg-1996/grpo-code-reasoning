@@ -29,10 +29,10 @@ GEMINI_API_KEY = os.environ.get("gemini_api_key", os.environ.get("api_key", ""))
 
 G = 8  # rollouts per problem (GROUP_SIZE alias below)
 GROUP_SIZE = G  # alias — used throughout reward.py and logging
-BATCH_SIZE = 4  # problems per training step → 4 * 8 = 32 completions per step
+BATCH_SIZE = 2  # problems per training step → 2 * 8 = 16 completions per step
 ROLLOUT_TEMPERATURE = 0.8
 EVAL_TEMPERATURE = 0.2
-MAX_NEW_TOKENS = 8192
+MAX_NEW_TOKENS = 2048
 MAX_PROMPT_LENGTH = 1024
 
 # ─────────────────────────────────────────
@@ -45,7 +45,7 @@ KL_COEFF = 0.04  # KL penalty — controls drift from reference model
 WARMUP_STEPS = 50  # short warmup, standard for RL fine-tuning
 MAX_TRAINING_STEPS = 2000  # ~enough for 4 curriculum phases + convergence
 GRADIENT_ACCUMULATION_STEPS = 4
-VLLM_GPU_MEMORY_UTILIZATION = 0.4  # tune based on smoke test; start conservative
+VLLM_GPU_MEMORY_UTILIZATION = 0.30  # leaves headroom for GRPO training tensors
 
 # ─────────────────────────────────────────
 # LoRA config

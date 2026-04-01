@@ -3,6 +3,7 @@
 Use this file as a quick execution checklist only.
 
 Canonical configuration lives in:
+
 - `config.py` (parameters/prompts/paths)
 - `README.md` (workflow and monitoring)
 
@@ -30,15 +31,21 @@ Pass condition: output contains `ALL SMOKE TESTS PASSED`.
 ## 3. Data Presence Check
 
 ```bash
-python -c "
+python - <<'PY'
 import os
 from config import APPS_CLEAN_PATH, LCB_SEEN_PATH, LCB_EVAL_PATH
-for label, path in [('APPS', APPS_CLEAN_PATH), ('LCB seen', LCB_SEEN_PATH), ('LCB eval', LCB_EVAL_PATH)]:
+
+for label, path in [
+    ("APPS", APPS_CLEAN_PATH),
+    ("LCB seen", LCB_SEEN_PATH),
+    ("LCB eval", LCB_EVAL_PATH),
+]:
     ok = os.path.exists(path)
-    print(f'{label}: {path} -> {"OK" if ok else "MISSING"}')
-    assert ok, f'Missing {path}'
-print('Data paths: PASS')
-"
+    print(f"{label}: {path} -> {'OK' if ok else 'MISSING'}")
+    assert ok, f"Missing {path}"
+
+print("Data paths: PASS")
+PY
 ```
 
 ## 4. Gemini API Check
@@ -64,6 +71,7 @@ This validates GRPOTrainer wiring with a tiny local run.
 ## 6. Sandbox Stress Test (recommended before long eval/train)
 
 Quick:
+
 ```bash
 python scripts/stress_execution.py \
   --rounds-clean 10 \
@@ -74,6 +82,7 @@ python scripts/stress_execution.py \
 ```
 
 Heavier:
+
 ```bash
 python scripts/stress_execution.py \
   --rounds-clean 30 \
@@ -90,8 +99,9 @@ python eval.py --model Qwen/Qwen2.5-Coder-7B-Instruct --save-debug-details
 ```
 
 Notes:
+
 - Eval artifacts are auto-saved to a timestamped folder:
-  `results/eval/<YYYYMMDD_HHMMSS>/`
+`results/eval/<YYYYMMDD_HHMMSS>/`
 - Files:
   - `summary.json`
   - `details.jsonl` (raw per-completion rows)
@@ -171,6 +181,8 @@ print('sample files:', files[:20])
 ```
 
 In W&B, confirm event metrics appear:
+
 - `event/checkpointing`
 - `event/checkpoint_save_s`
 - `event/hf_push_s`
+
