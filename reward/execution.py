@@ -18,6 +18,7 @@ import contextlib
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from config import EXEC_TIMEOUT as SUBPROCESS_TIMEOUT, EXEC_WORKERS as POOL_WORKERS, MAX_TEST_CASES
+from problem_format import get_function_name, is_function_style_problem
 
 sys.set_int_max_str_digits(100000)
 
@@ -195,9 +196,8 @@ def score_single(
     # cap test cases
     test_cases = test_cases[:MAX_TEST_CASES]
 
-    is_lc = problem.get("is_leetcode", False)
-    func_name = problem.get("func_name", "") or problem.get("fn_name", "")
-    is_function_style = bool(func_name and (is_lc or ("fn_name" in problem) or problem.get("functional_tests")))
+    func_name = get_function_name(problem)
+    is_function_style = is_function_style_problem(problem)
 
     if is_function_style:
         status, result = _run_subprocess(
@@ -233,9 +233,8 @@ def _pool_worker_wrapper(args):
         return 0.0, "empty"
 
     test_cases = test_cases[:MAX_TEST_CASES]
-    is_lc = problem.get("is_leetcode", False)
-    func_name = problem.get("func_name", "") or problem.get("fn_name", "")
-    is_function_style = bool(func_name and (is_lc or ("fn_name" in problem) or problem.get("functional_tests")))
+    func_name = get_function_name(problem)
+    is_function_style = is_function_style_problem(problem)
 
     if is_function_style:
         status, result = _run_subprocess(
@@ -301,7 +300,11 @@ def score_batch(
         "mean_score": sum(scores) / n,
         "zero_scores": sum(1 for s in scores if s == 0.0),
         "perfect_scores": sum(1 for s in scores if s == 1.0),
+        "ok_count": sum(1 for s in statuses if s == "ok"),
+        "error_count": sum(1 for s in statuses if s == "error"),
+        "empty_count": sum(1 for s in statuses if s == "empty"),
         "timeout_count": sum(1 for s in statuses if s == "timeout"),
+        "zero_ok_count": sum(1 for score, status in zip(scores, statuses) if status == "ok" and score == 0.0),
         "timeout_fraction": sum(1 for s in statuses if s == "timeout") / n,
     }
     return scores, stats

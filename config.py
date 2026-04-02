@@ -87,9 +87,17 @@ REWARD_STD_WARNING_THRESHOLD = 0.05  # reward_std below this → diversity colla
 # Gemini judge
 # ─────────────────────────────────────────
 
-GEMINI_MAX_WORKERS = 32  # I/O-bound thread pool for parallel Gemini calls
-GEMINI_TIMEOUT = 30  # seconds per Gemini API call before fallback
-GEMINI_MAX_TOKENS = 512  # judge response is short, cap output tokens
+# Max concurrent Gemini calls in one reward batch.
+# Keep modest to reduce 429 rate-limit bursts.
+GEMINI_MAX_WORKERS = 4
+# Timeout per call (seconds).
+GEMINI_TIMEOUT = 30
+# Judge response is short; cap output tokens.
+GEMINI_MAX_TOKENS = 512
+# Retry policy for transient API failures (429/5xx/timeouts).
+GEMINI_MAX_RETRIES = 5
+GEMINI_RETRY_BASE_DELAY_S = 1.5
+GEMINI_RETRY_MAX_DELAY_S = 30.0
 
 # ─────────────────────────────────────────
 # Execution sandbox
@@ -202,7 +210,7 @@ First, think through your approach inside <think> tags using exactly these steps
 [STEP] Implementation plan: how to translate the approach to code
 
 Then write your complete Python solution inside <code> tags.
-Read input from stdin and print output to stdout.
+Follow the output format requirements in the user prompt exactly.
 
 Use as many [STEP] blocks as you need — there is no limit."""
 

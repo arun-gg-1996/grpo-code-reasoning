@@ -63,6 +63,7 @@ from config import (
     get_curriculum_weights,
     normalize_difficulty,
 )
+from problem_format import is_function_style_problem, get_function_name
 from reward.reward import reward_fn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -124,13 +125,16 @@ def load_problems(path: str, source_label: str) -> list[dict]:
 def build_prompt(problem: dict) -> str:
     """Build the training prompt for a problem."""
     question = problem.get("question", "")
-    is_lc_func = bool(problem.get("is_leetcode") and problem.get("func_name"))
+    is_func_style = is_function_style_problem(problem)
+    func_name = get_function_name(problem)
 
-    if is_lc_func:
+    if is_func_style:
+        fn_line = f"- Implement the expected function `{func_name}` exactly.\n" if func_name else ""
         format_hint = (
             "Output format requirement:\n"
             "- This is a function-style problem.\n"
             "- In <code>...</code>, provide only the function/class implementation expected by the prompt.\n"
+            f"{fn_line}"
             "- Do NOT read from stdin and do NOT print to stdout unless explicitly required by the statement.\n"
             "- Inside <code>, output raw Python only (no triple backticks)."
         )
@@ -403,6 +407,30 @@ def main():
         default="results/train",
         help="Base directory for timestamped training artifacts",
     )
+    parser.add_argument(
+        "--rollout-temperature",
+        type=float,
+        default=None,
+        help="Override generation temperature for GRPO rollouts.",
+    )
+    parser.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=float,
+        default=None,
+        help="Override vLLM GPU memory utilization fraction.",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+        help="Override max completion tokens used during training generation.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Override per-device train batch size.",
+    )
     args = parser.parse_args()
 
     # Smoke test overrides
@@ -413,6 +441,8 @@ def main():
         group_size = 4
         save_steps = 999
         vllm_mem = 0.3
+        rollout_temperature = ROLLOUT_TEMPERATURE
+        max_new_tokens = 512
         use_wandb = False
         smoke_use_gpu = torch.cuda.is_available()
         smoke_use_vllm = smoke_use_gpu
@@ -429,7 +459,27 @@ def main():
         group_size = GROUP_SIZE
         save_steps = SAVE_STEPS
         vllm_mem = VLLM_GPU_MEMORY_UTILIZATION
+        rollout_temperature = ROLLOUT_TEMPERATURE
+        max_new_tokens = MAX_NEW_TOKENS
         use_wandb = True
+
+    # Optional runtime overrides for tuning sweeps.
+    if args.batch_size is not None:
+        if args.batch_size <= 0:
+            raise ValueError("--batch-size must be > 0")
+        batch_size = args.batch_size
+    if args.rollout_temperature is not None:
+        if args.rollout_temperature <= 0:
+            raise ValueError("--rollout-temperature must be > 0")
+        rollout_temperature = args.rollout_temperature
+    if args.vllm_gpu_memory_utilization is not None:
+        if not (0.05 <= args.vllm_gpu_memory_utilization <= 0.95):
+            raise ValueError("--vllm-gpu-memory-utilization must be in [0.05, 0.95]")
+        vllm_mem = args.vllm_gpu_memory_utilization
+    if args.max_new_tokens is not None:
+        if args.max_new_tokens <= 0:
+            raise ValueError("--max-new-tokens must be > 0")
+        max_new_tokens = args.max_new_tokens
 
     # Timestamped train artifacts (similar to eval run folders)
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -457,6 +507,9 @@ def main():
             "group_size": group_size,
             "lr": LEARNING_RATE,
             "kl_coeff": KL_COEFF,
+            "rollout_temperature": rollout_temperature,
+            "max_new_tokens": max_new_tokens,
+            "vllm_gpu_memory_utilization": vllm_mem,
             "lora_rank": LORA_RANK,
         })
 
@@ -526,10 +579,10 @@ def main():
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS if not args.smoke_test else 1,
         learning_rate=LEARNING_RATE,
         warmup_steps=WARMUP_STEPS if not args.smoke_test else 2,
-        max_completion_length=MAX_NEW_TOKENS if not args.smoke_test else 512,
+        max_completion_length=max_new_tokens,
         num_generations=group_size,
         generation_batch_size=batch_size * group_size,
-        temperature=ROLLOUT_TEMPERATURE,
+        temperature=rollout_temperature,
         beta=KL_COEFF,
         logging_steps=LOGGING_STEPS,
         save_steps=save_steps,
@@ -573,6 +626,9 @@ def main():
         "max_steps": int(max_steps),
         "batch_size": int(batch_size),
         "group_size": int(group_size),
+        "rollout_temperature": float(rollout_temperature),
+        "max_new_tokens": int(max_new_tokens),
+        "vllm_gpu_memory_utilization": float(vllm_mem),
         "save_debug_details": bool(args.save_debug_details and (not args.smoke_test)),
         "train_debug_details_path": (
             os.path.abspath(train_debug_path)

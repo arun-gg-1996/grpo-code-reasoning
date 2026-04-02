@@ -1,115 +1,106 @@
-# W&B Report Template (Copy/Paste)
+# W&B Report Template (GRPO)
 
-Use this as a starter template in a W&B Report.
+Use this when creating a run report for `grpo-code-gen`.
 
----
+## Section 1: Learning Signal
 
-## Learning
-
-Track whether policy learning is improving and whether GRPO has useful contrast.
-
-**Pin these charts**
-
+Pin:
 - `reward/mean`
 - `reward/execution_mean`
 - `reward/reasoning_mean`
 - `grpo/reward_std_mean`
 - `grpo/all_zero_fraction`
 - `grpo/all_perfect_fraction`
-- `kl`
+- `train/kl`
 
-**How to read**
+Read:
+- `grpo/reward_std_mean` near 0 means weak GRPO contrast.
+- high `grpo/all_zero_fraction` means collapse on current distribution.
 
-- `reward/mean` should trend up over time.
-- `grpo/reward_std_mean` should stay clearly above zero.
-- `grpo/all_zero_fraction` should stay low (too high means collapse).
+## Section 2: Execution Health
 
----
+Pin:
+- `exec/zero_fraction`
+- `exec/infra_zero_fraction`
+- `exec/model_zero_fraction`
+- `exec/timeout_fraction`
+- `exec/ok_fraction`
+- `exec/error_fraction`
+- `exec/empty_fraction`
+- `exec/nonzero_mean`
 
-## Quality
+Read:
+- high `infra_zero_fraction` points to format/runtime/infrastructure issues.
+- high `model_zero_fraction` means code executes but fails logic tests.
+- low `nonzero_mean` means capability gap on solved-format outputs.
 
-Track generation quality and judge reliability.
+## Section 3: Generation Quality
 
-**Pin these charts**
-
+Pin:
 - `gen/valid_code_fraction`
 - `gen/has_reasoning_fraction`
 - `gen/empty_completion_fraction`
-- `exec/timeout_fraction`
-- `exec/zero_fraction`
+- `gen/mean_think_chars`
+- `gen/mean_code_chars`
+- `gen/likely_truncated_fraction`
+
+Read:
+- low `valid_code_fraction` usually indicates formatting drift.
+- high `likely_truncated_fraction` means increase `max_new_tokens`.
+
+## Section 4: Gemini Reliability
+
+Pin:
 - `judge/fallback_fraction`
 - `judge/step_json_fraction`
+- `judge/retry_count`
+- `judge/rate_limit_count`
+- `timing/reward_judge_s`
 
-**How to read**
+Read:
+- rising `rate_limit_count` + `retry_count` indicates quota/concurrency pressure.
+- high `fallback_fraction` indicates degraded judge signal quality.
 
-- `gen/valid_code_fraction` should remain high.
-- `judge/fallback_fraction` should be near zero.
-- `judge/step_json_fraction` should be near one.
+## Section 5: Throughput and System
 
----
-
-## Timing
-
-Track where step time is spent.
-
-**Pin these charts**
-
+Pin:
 - `timing/step_total_s`
 - `timing/generation_s`
-- `timing/reward_calc_s`
 - `timing/reward_execution_s`
-- `timing/reward_judge_s`
 - `timing/loss_compute_s`
-
-**How to read**
-
-- `timing/step_total_s` is end-to-end optimizer step time.
-- Use component charts to find bottlenecks (generation vs reward vs loss).
-
----
-
-## System
-
-Track machine pressure and GPU usage.
-
-**Pin these charts**
-
 - `gpu/utilization_percent`
 - `gpu/nvml_mem_used_gb`
-- `gpu/torch_reserved_gb`
 - `gpu/non_torch_mem_gb_est`
-- `system/cpu_percent`
 - `system/ram_percent`
 
-**How to read**
+Read:
+- use timing breakdown to locate bottleneck before retuning.
 
-- `gpu/nvml_mem_used_gb` is total GPU memory in use.
-- `gpu/non_torch_mem_gb_est` is a rough proxy for non-PyTorch usage (often vLLM/runtime).
+## Section 6: Checkpoints and Pushes
 
----
-
-## Events
-
-Track save/push overhead and cadence.
-
-**Pin these charts**
-
+Pin:
 - `event/checkpointing`
 - `event/checkpoint_save_s`
 - `event/hf_push_s`
 
-**How to read**
+Read:
+- spikes here are expected at save/push boundaries.
 
-- `event/checkpointing` acts as a pulse marker when a save occurs.
-- Duration charts show overhead added by saving/uploading.
+## Section 7: Warning Flags
 
----
+Pin all warning flags:
+- `grpo/warn_reward_std_collapse`
+- `grpo/warn_all_zero_collapse`
+- `warn/format_failure`
+- `warn/exec_formatting_breakdown`
+- `warn/exec_zero_sandbox`
+- `warn/exec_low_nonzero`
+- `warn/reasoning_collapse`
+- `warn/gemini_silent_failure`
+- `warn/problems_too_easy`
+- `warn/empty_completions`
+- `warn/high_timeout_rate`
 
-## Optional Debug Section
-
-If needed, add a separate section for low-level debug metrics:
-
-- warning flags (`warn/`*, `grpo/warn_*`)
-- per-source reward splits (`reward/apps_mean`, `reward/lcb_mean`)
-- data coverage (`data/*`)
+Read:
+- investigate immediately when any warning flag stays at `1` for multiple steps.
 

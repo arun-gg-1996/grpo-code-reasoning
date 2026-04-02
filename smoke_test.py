@@ -44,6 +44,9 @@ def test_imports():
     from reward.judge import parse_judge_response
     print("  reward.judge: OK")
 
+    import problem_format
+    print("  problem_format: OK")
+
     return True
 
 
@@ -51,6 +54,7 @@ def test_config_logic():
     """Test config helpers."""
     print("\n--- Testing config logic ---")
     from config import normalize_difficulty, get_curriculum_weights
+    from problem_format import is_function_style_problem, get_function_name
 
     assert normalize_difficulty("introductory") == "easy"
     assert normalize_difficulty("interview") == "medium"
@@ -63,6 +67,13 @@ def test_config_logic():
     w800 = get_curriculum_weights(800)
     assert w800["hard"] == 0.2
     print("  get_curriculum_weights: OK")
+
+    p_fn = {"fn_name": "twoSum", "is_leetcode": False}
+    p_stdio = {"is_leetcode": False}
+    assert is_function_style_problem(p_fn) is True
+    assert get_function_name(p_fn) == "twoSum"
+    assert is_function_style_problem(p_stdio) is False
+    print("  problem_format helpers: OK")
 
 
 def test_extraction():
@@ -121,8 +132,15 @@ def test_judge_parse():
     assert r2 is not None
     print(f"  markdown fence parse: overall={r2['overall']}")
 
-    # Invalid
-    r3 = parse_judge_response("this is not json")
+    # Invalid (suppress expected warning noise for this test case)
+    import logging
+    judge_logger = logging.getLogger("reward.judge")
+    prev_level = judge_logger.level
+    judge_logger.setLevel(logging.ERROR)
+    try:
+        r3 = parse_judge_response("this is not json")
+    finally:
+        judge_logger.setLevel(prev_level)
     assert r3 is None
     print("  invalid parse: None (correct)")
 
@@ -308,9 +326,12 @@ def test_data_loading():
 
 
 def test_prompt_format_hints():
-    """Verify prompt includes interface-specific format guidance."""
+    """Verify format-routing logic and global prompt guidance."""
     print("\n--- Testing prompt format hints ---")
-    from train import build_prompt
+    from config import TRAINING_SYSTEM_PROMPT
+    from problem_format import is_function_style_problem, get_function_name
+
+    assert "Follow the output format requirements in the user prompt exactly." in TRAINING_SYSTEM_PROMPT
 
     stdio_problem = {
         "question": "Read n and print n",
@@ -318,9 +339,7 @@ def test_prompt_format_hints():
         "is_leetcode": False,
         "func_name": None,
     }
-    p_stdio = build_prompt(stdio_problem)
-    assert "stdin/stdout problem" in p_stdio
-    assert "no triple backticks" in p_stdio
+    assert is_function_style_problem(stdio_problem) is False
 
     func_problem = {
         "question": "Implement function foo",
@@ -328,11 +347,9 @@ def test_prompt_format_hints():
         "is_leetcode": True,
         "func_name": "foo",
     }
-    p_func = build_prompt(func_problem)
-    assert "function-style problem" in p_func
-    assert "Do NOT read from stdin" in p_func
-    assert "no triple backticks" in p_func
-    print("  build_prompt format hints: OK")
+    assert is_function_style_problem(func_problem) is True
+    assert get_function_name(func_problem) == "foo"
+    print("  prompt format routing: OK")
 
 
 if __name__ == "__main__":

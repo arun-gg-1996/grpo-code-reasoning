@@ -1,200 +1,162 @@
-# Pre-Training Validation Checklist
+# Pre-Train Checklist (Operator Reference)
 
-Use this file as a quick execution checklist only.
+This file is the command-focused companion to `README.md`.
 
-Canonical configuration lives in:
+If you want one command, use:
 
-- `config.py` (parameters/prompts/paths)
-- `README.md` (workflow and monitoring)
-
-If this checklist and code ever disagree, trust code.
+```bash
+bash scripts/pretrain_checks.sh
+```
 
 ---
 
-## 1. Environment
+## Required Before Every Training Run
 
 ```bash
 source venv/bin/activate
-python --version
-nvidia-smi
-python -c "import torch; print('CUDA:', torch.cuda.is_available(), '| Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+bash scripts/pretrain_checks.sh
 ```
 
-## 2. Core Smoke Test (required)
+Pass condition: script exits 0 and prints `All pre-train checks passed.`
+
+---
+
+## Manual Equivalent (If You Prefer Step-By-Step)
+
+### 1) Environment + GPU
 
 ```bash
-python smoke_test.py
+python --version
+python -c "import torch; print('CUDA:', torch.cuda.is_available(), '| Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+nvidia-smi
 ```
 
-Pass condition: output contains `ALL SMOKE TESTS PASSED`.
-
-## 3. Data Presence Check
+### 2) Data Presence
 
 ```bash
 python - <<'PY'
 import os
 from config import APPS_CLEAN_PATH, LCB_SEEN_PATH, LCB_EVAL_PATH
-
 for label, path in [
-    ("APPS", APPS_CLEAN_PATH),
-    ("LCB seen", LCB_SEEN_PATH),
-    ("LCB eval", LCB_EVAL_PATH),
+    ('APPS', APPS_CLEAN_PATH),
+    ('LCB train', LCB_SEEN_PATH),
+    ('LCB eval', LCB_EVAL_PATH),
 ]:
     ok = os.path.exists(path)
-    print(f"{label}: {path} -> {'OK' if ok else 'MISSING'}")
-    assert ok, f"Missing {path}"
-
-print("Data paths: PASS")
+    print(f'{label}: {path} -> {"OK" if ok else "MISSING"}')
+    assert ok, f'Missing {path}'
+print('data_paths: PASS')
 PY
 ```
 
-## 4. Gemini API Check
+### 3) Core Smoke Test
 
 ```bash
-python -c "
-from reward.judge import score_batch
-scores = score_batch(['Print hello world'], ['[STEP] Use print statement'], ['medium'])
-print('Gemini score:', scores)
-assert len(scores) == 1 and 0.0 <= scores[0] <= 1.0
-print('Gemini: PASS')
-"
+python smoke_test.py
 ```
 
-## 5. Optional End-to-End Trainer Smoke
+### 4) Live Gemini Check
+
+```bash
+python - <<'PY'
+from reward.judge import score_batch, get_last_batch_stats
+problems = ['Print hello world', 'Given integer n, print n squared']
+thinks = [
+    '[STEP] Print a constant string to stdout.',
+    '[STEP] Read n, compute n*n, print result.',
+]
+difficulties = ['medium', 'medium']
+scores = score_batch(problems, thinks, difficulties)
+stats = get_last_batch_stats()
+print('gemini_score:', scores)
+print('gemini_stats:', stats)
+assert len(scores) == len(problems)
+assert all(0.0 <= s <= 1.0 for s in scores)
+assert stats.get('fallback_fraction', 1.0) < 1.0
+print('gemini_check: PASS')
+PY
+```
+
+### 5) Optional Trainer Smoke
 
 ```bash
 python train.py --smoke-test
 ```
 
-This validates GRPOTrainer wiring with a tiny local run.
+---
 
-## 6. Sandbox Stress Test (recommended before long eval/train)
+## Start Training
 
-Quick:
-
-```bash
-python scripts/stress_execution.py \
-  --rounds-clean 10 \
-  --rounds-mixed 5 \
-  --batch-size 32 \
-  --workers 16 \
-  --timeout 5
-```
-
-Heavier:
+Default:
 
 ```bash
-python scripts/stress_execution.py \
-  --rounds-clean 30 \
-  --rounds-mixed 10 \
-  --batch-size 32 \
-  --workers 16 \
-  --timeout 5
+python train.py --save-debug-details
 ```
 
-## 7. Baseline Eval Before Full Training
+Recommended stabilization config:
 
 ```bash
-python eval.py --model Qwen/Qwen2.5-Coder-7B-Instruct --save-debug-details
+python train.py \
+  --save-debug-details \
+  --batch-size 2 \
+  --rollout-temperature 0.7 \
+  --vllm-gpu-memory-utilization 0.25 \
+  --max-new-tokens 2048
 ```
 
-Notes:
+---
 
-- Eval artifacts are auto-saved to a timestamped folder:
-`results/eval/<YYYYMMDD_HHMMSS>/`
-- Files:
-  - `summary.json`
-  - `details.jsonl` (raw per-completion rows)
+## Evaluate Baseline / Checkpoints
 
-Live tail while eval runs:
+Baseline:
 
 ```bash
-latest=$(ls -1dt results/eval/*/ | head -n 1)
-tail -f "${latest}details.jsonl"
+python eval.py \
+  --model Qwen/Qwen2.5-Coder-7B-Instruct \
+  --output-dir results/eval \
+  --save-debug-details
 ```
 
-Verify new execution aggregates exist after eval:
+Checkpoint:
 
 ```bash
-python - <<'PY'
-import json,glob
-p=sorted(glob.glob("results/eval/*/summary.json"))[-1]
-d=json.load(open(p))
-print("summary:", p)
-print("has execution_metrics:", "execution_metrics" in d)
-for k in sorted(d.get("execution_metrics",{}).keys()):
-    print(k, "=", d["execution_metrics"][k])
-PY
+python eval.py \
+  --model checkpoints/Qwen2.5-Coder-7B-Instruct-grpo/checkpoint-2000 \
+  --output-dir results/eval \
+  --save-debug-details
 ```
 
-Pull latest eval folder from server to local machine:
+---
+
+## Optional Stress / Diagnostics
+
+Execution stress:
 
 ```bash
-bash scripts/pull_latest_eval.sh
+python scripts/stress_execution.py --rounds-clean 10 --rounds-mixed 5 --batch-size 32 --workers 16 --timeout 5
 ```
 
-Regression check for fence sanitization using real training completions:
+Fence sanitization regression:
 
 ```bash
 python scripts/test_fence_sanitization.py
 ```
 
-## 8. Start Full Training
+Check continue/stop decision from W&B run:
 
 ```bash
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-python train.py --save-debug-details
+python scripts/check_continue_stop.py \
+  --entity <wandb-entity> \
+  --project grpo-code-gen \
+  --run <run_id>
 ```
 
-Pull latest training debug artifacts from server to local machine:
+---
+
+## Pull Latest Artifacts
 
 ```bash
 bash scripts/pull_latest_train.sh
+bash scripts/pull_latest_eval.sh
 ```
-
-Monitor in W&B using the project configured in `config.py`.
-
-## 9. Verify Checkpointing + HF Push (during real training)
-
-Run these checks after training starts:
-
-```bash
-python -c "
-from config import PUSH_TO_HUB, HUB_MODEL_ID, SAVE_STEPS
-print('PUSH_TO_HUB:', PUSH_TO_HUB)
-print('HUB_MODEL_ID:', HUB_MODEL_ID)
-print('SAVE_STEPS:', SAVE_STEPS)
-"
-```
-
-```bash
-python -c "
-from huggingface_hub import HfApi
-print('HF user:', HfApi().whoami()['name'])
-"
-```
-
-After first save step (default every 200 steps), verify local checkpoint:
-
-```bash
-ls -la checkpoints/Qwen2.5-Coder-7B-Instruct-grpo | head
-ls -la checkpoints/Qwen2.5-Coder-7B-Instruct-grpo/checkpoint-200
-```
-
-Verify Hub repo updated:
-
-```bash
-python -c "
-from config import HUB_MODEL_ID
-from huggingface_hub import list_repo_files
-files = list_repo_files(HUB_MODEL_ID)
-print('repo file count:', len(files))
-print('sample files:', files[:20])
-"
-```
-
-In W&B, confirm event metrics appear:
-
-- `event/checkpointing`
-- `event/checkpoint_save_s`
-- `event/hf_push_s`

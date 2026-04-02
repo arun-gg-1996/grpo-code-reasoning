@@ -13,12 +13,24 @@ All batch calls are concurrent via asyncio.gather.
 import asyncio
 import json
 import logging
+import random
 import re
 from typing import Optional
 
 import httpx
 
-from config import JUDGE_MODEL, JUDGE_SYSTEM_PROMPT, JUDGE_TEMPERATURE, JUDGE_MAX_TOKENS, JUDGE_TIMEOUT, GEMINI_API_KEY
+from config import (
+    JUDGE_MODEL,
+    JUDGE_SYSTEM_PROMPT,
+    JUDGE_TEMPERATURE,
+    JUDGE_MAX_TOKENS,
+    JUDGE_TIMEOUT,
+    GEMINI_API_KEY,
+    GEMINI_MAX_WORKERS,
+    GEMINI_MAX_RETRIES,
+    GEMINI_RETRY_BASE_DELAY_S,
+    GEMINI_RETRY_MAX_DELAY_S,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +40,8 @@ _last_batch_stats = {
     "total_calls": 0,
     "fallback_count": 0,
     "fallback_fraction": 0.0,
+    "retry_count": 0,
+    "rate_limit_count": 0,
 }
 
 
@@ -103,33 +117,71 @@ async def _call_single(
     problem: str,
     think_block: str,
     difficulty: str,
-) -> tuple[float, bool, bool]:
+) -> tuple[float, bool, bool, int, int]:
     """Single async Gemini call. Returns (score, used_fallback, used_step_scores)."""
     body = _build_request_body(problem, think_block, difficulty)
     url = f"{VERTEX_URL}?key={api_key}"
+    retry_count = 0
+    rate_limit_count = 0
 
-    try:
-        resp = await client.post(url, json=body, timeout=JUDGE_TIMEOUT)
-
-        if resp.status_code == 429:
-            await asyncio.sleep(2.0)
+    for attempt in range(max(0, GEMINI_MAX_RETRIES) + 1):
+        try:
             resp = await client.post(url, json=body, timeout=JUDGE_TIMEOUT)
+            if resp.status_code == 429:
+                rate_limit_count += 1
+                if attempt < GEMINI_MAX_RETRIES:
+                    retry_count += 1
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = float(retry_after)
+                        except Exception:
+                            delay = 0.0
+                    else:
+                        delay = min(
+                            GEMINI_RETRY_MAX_DELAY_S,
+                            GEMINI_RETRY_BASE_DELAY_S * (2**attempt),
+                        )
+                    await asyncio.sleep(delay + random.uniform(0.0, 0.25))
+                    continue
 
-        resp.raise_for_status()
-        data = resp.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        parsed = parse_judge_response(text)
-        if parsed is not None:
-            steps = parsed.get("step_scores", [])
-            if steps:
-                # Judge score is derived from per-step quality.
-                return float(sum(steps) / len(steps)), False, True
-            return parsed["overall"], False, False
-        return 0.5, True, False
+            if 500 <= resp.status_code < 600 and attempt < GEMINI_MAX_RETRIES:
+                retry_count += 1
+                delay = min(
+                    GEMINI_RETRY_MAX_DELAY_S,
+                    GEMINI_RETRY_BASE_DELAY_S * (2**attempt),
+                )
+                await asyncio.sleep(delay + random.uniform(0.0, 0.25))
+                continue
 
-    except Exception as e:
-        logger.warning(f"Gemini API error: {e}")
-        return 0.5, True, False
+            resp.raise_for_status()
+            data = resp.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            parsed = parse_judge_response(text)
+            if parsed is not None:
+                steps = parsed.get("step_scores", [])
+                if steps:
+                    # Judge score is derived from per-step quality.
+                    return float(sum(steps) / len(steps)), False, True, retry_count, rate_limit_count
+                return parsed["overall"], False, False, retry_count, rate_limit_count
+            return 0.5, True, False, retry_count, rate_limit_count
+
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ReadError, httpx.ConnectError) as e:
+            if attempt < GEMINI_MAX_RETRIES:
+                retry_count += 1
+                delay = min(
+                    GEMINI_RETRY_MAX_DELAY_S,
+                    GEMINI_RETRY_BASE_DELAY_S * (2**attempt),
+                )
+                await asyncio.sleep(delay + random.uniform(0.0, 0.25))
+                continue
+            logger.warning(f"Gemini API transient error (retries exhausted): {e}")
+            return 0.5, True, False, retry_count, rate_limit_count
+        except Exception as e:
+            logger.warning(f"Gemini API error: {e}")
+            return 0.5, True, False, retry_count, rate_limit_count
+
+    return 0.5, True, False, retry_count, rate_limit_count
 
 
 async def _score_batch_async(
@@ -137,10 +189,16 @@ async def _score_batch_async(
     think_blocks: list[str],
     difficulties: list[str],
     api_key: str,
-) -> list[tuple[float, bool, bool]]:
+) -> list[tuple[float, bool, bool, int, int]]:
+    sem = asyncio.Semaphore(max(1, GEMINI_MAX_WORKERS))
+
+    async def _guarded_call(prob: str, think: str, diff: str) -> tuple[float, bool, bool, int, int]:
+        async with sem:
+            return await _call_single(client, api_key, prob, think, diff)
+
     async with httpx.AsyncClient() as client:
         tasks = [
-            _call_single(client, api_key, prob, think, diff)
+            _guarded_call(prob, think, diff)
             for prob, think, diff in zip(problems, think_blocks, difficulties)
         ]
         return await asyncio.gather(*tasks)
@@ -171,13 +229,17 @@ def score_batch(
             "fallback_fraction": 1.0 if n > 0 else 0.0,
             "step_json_count": 0,
             "step_json_fraction": 0.0,
+            "retry_count": 0,
+            "rate_limit_count": 0,
         }
         return [0.5] * len(problems)
 
     triples = asyncio.run(_score_batch_async(problems, think_blocks, difficulties, api_key))
-    scores = [s for s, _, _ in triples]
-    fallback_count = sum(1 for _, used_fallback, _ in triples if used_fallback)
-    step_json_count = sum(1 for _, _, used_steps in triples if used_steps)
+    scores = [s for s, _, _, _, _ in triples]
+    fallback_count = sum(1 for _, used_fallback, _, _, _ in triples if used_fallback)
+    step_json_count = sum(1 for _, _, used_steps, _, _ in triples if used_steps)
+    retry_count = sum(retries for _, _, _, retries, _ in triples)
+    rate_limit_count = sum(rl for _, _, _, _, rl in triples)
     total = len(triples)
     _last_batch_stats = {
         "total_calls": total,
@@ -185,5 +247,7 @@ def score_batch(
         "fallback_fraction": (fallback_count / total) if total > 0 else 0.0,
         "step_json_count": step_json_count,
         "step_json_fraction": (step_json_count / total) if total > 0 else 0.0,
+        "retry_count": retry_count,
+        "rate_limit_count": rate_limit_count,
     }
     return scores

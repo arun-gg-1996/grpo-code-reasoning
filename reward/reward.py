@@ -375,7 +375,11 @@ def _log_metrics(
             "exec/mean_score": exec_stats.get("mean_score", 0),
             "exec/zero_scores": exec_stats.get("zero_scores", 0),
             "exec/perfect_scores": exec_stats.get("perfect_scores", 0),
+            "exec/ok_count": exec_stats.get("ok_count", 0),
+            "exec/error_count": exec_stats.get("error_count", 0),
+            "exec/empty_count": exec_stats.get("empty_count", 0),
             "exec/timeout_count": exec_stats.get("timeout_count", 0),
+            "exec/zero_ok_count": exec_stats.get("zero_ok_count", 0),
             "exec/timeout_fraction": exec_stats.get("timeout_fraction", 0.0),
             # Presence / reasoning quality
             "presence/mean": presence_arr.mean(),
@@ -402,6 +406,10 @@ def _log_metrics(
         }
         if timing:
             log_dict.update(timing)
+        if n > 0:
+            log_dict["exec/ok_fraction"] = log_dict["exec/ok_count"] / n
+            log_dict["exec/error_fraction"] = log_dict["exec/error_count"] / n
+            log_dict["exec/empty_fraction"] = log_dict["exec/empty_count"] / n
 
         # Per-difficulty breakdown
         for diff_name in ("easy", "medium", "hard"):
@@ -436,6 +444,8 @@ def _log_metrics(
                 log_dict["judge/fallback_fraction"] = judge_stats.get("fallback_fraction", 0.0)
                 log_dict["judge/step_json_count"] = judge_stats.get("step_json_count", 0)
                 log_dict["judge/step_json_fraction"] = judge_stats.get("step_json_fraction", 0.0)
+                log_dict["judge/retry_count"] = judge_stats.get("retry_count", 0)
+                log_dict["judge/rate_limit_count"] = judge_stats.get("rate_limit_count", 0)
             except Exception:
                 pass
 
@@ -444,6 +454,14 @@ def _log_metrics(
         nonzero_exec = exec_arr[exec_arr > 0.0]
         exec_nonzero_mean = float(nonzero_exec.mean()) if len(nonzero_exec) > 0 else None
         log_dict["exec/zero_fraction"] = exec_zero_frac
+        if n > 0:
+            infra_zero_count = (
+                log_dict.get("exec/error_count", 0)
+                + log_dict.get("exec/timeout_count", 0)
+                + log_dict.get("exec/empty_count", 0)
+            )
+            log_dict["exec/infra_zero_fraction"] = infra_zero_count / n
+            log_dict["exec/model_zero_fraction"] = log_dict.get("exec/zero_ok_count", 0) / n
         if exec_nonzero_mean is not None:
             log_dict["exec/nonzero_mean"] = exec_nonzero_mean
 

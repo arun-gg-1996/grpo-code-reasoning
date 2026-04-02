@@ -2,6 +2,26 @@
 
 This file explains the custom metrics logged by this project to Weights & Biases.
 
+## Operator Watchlist (Pin These First)
+
+For the first 30-60 minutes of a training run, prioritize:
+
+- `reward/execution_mean`
+- `exec/zero_fraction`
+- `exec/infra_zero_fraction`
+- `exec/model_zero_fraction`
+- `gen/valid_code_fraction`
+- `grpo/reward_std_mean`
+- `judge/fallback_fraction`
+- `judge/retry_count`
+- `judge/rate_limit_count`
+
+Quick interpretation:
+- High `exec/infra_zero_fraction` = format/runtime/infrastructure failures.
+- High `exec/model_zero_fraction` = code runs but fails tests (capability issue).
+- Near-zero `grpo/reward_std_mean` = weak GRPO contrast signal.
+- High `judge/fallback_fraction` with rising retries/rate limits = unreliable judge signal.
+
 ## Learning (`reward/*`, `grpo/*`, `exec/*`, `judge/*`)
 
 ### `reward/*`
@@ -25,9 +45,18 @@ This file explains the custom metrics logged by this project to Weights & Biases
 - `exec/mean_score`: average execution score.
 - `exec/zero_scores`: count of completions with execution score 0.
 - `exec/perfect_scores`: count of completions with execution score 1.
+- `exec/ok_count`: count of executions that ran and returned test results.
+- `exec/error_count`: count of executions that failed with runtime/checker errors.
+- `exec/empty_count`: count with empty/missing code or missing test cases.
 - `exec/timeout_count`: count of sandbox timeouts.
+- `exec/zero_ok_count`: zero-score executions among successful runs (`ok_count`).
+- `exec/ok_fraction`: ok_count / batch_size.
+- `exec/error_fraction`: error_count / batch_size.
+- `exec/empty_fraction`: empty_count / batch_size.
 - `exec/timeout_fraction`: timeout ratio in batch.
 - `exec/zero_fraction`: fraction of completions with execution score 0.
+- `exec/infra_zero_fraction`: zeros caused by error/timeout/empty statuses.
+- `exec/model_zero_fraction`: zeros from `ok` runs that passed 0 tests.
 - `exec/nonzero_mean`: average execution score among non-zero completions only.
 - `exec/apps_mean`: average execution score on APPS samples.
 - `exec/lcb_mean`: average execution score on LCB samples.
@@ -40,6 +69,8 @@ This file explains the custom metrics logged by this project to Weights & Biases
 - `judge/fallback_fraction`: fallback_count / total_calls.
 - `judge/step_json_count`: how many judge responses had valid per-step JSON.
 - `judge/step_json_fraction`: step_json_count / total_calls.
+- `judge/retry_count`: total retry attempts made in this batch.
+- `judge/rate_limit_count`: number of Gemini 429 responses encountered.
 
 ## Generation Quality (`gen/*`, `presence/*`)
 
