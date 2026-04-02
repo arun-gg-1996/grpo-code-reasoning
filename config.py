@@ -30,7 +30,7 @@ GEMINI_API_KEY = os.environ.get("gemini_api_key", os.environ.get("api_key", ""))
 G = 8  # rollouts per problem (GROUP_SIZE alias below)
 GROUP_SIZE = G  # alias — used throughout reward.py and logging
 BATCH_SIZE = 2  # problems per training step → 2 * 8 = 16 completions per step
-ROLLOUT_TEMPERATURE = 0.3
+ROLLOUT_TEMPERATURE = 0.7
 EVAL_TEMPERATURE = 0.2
 MAX_NEW_TOKENS = 2048
 MAX_PROMPT_LENGTH = 1024
@@ -71,9 +71,9 @@ LCB_EXEC_WEIGHT = 0.60
 LCB_REASONING_WEIGHT = 0.40
 
 # Tier-weighted reasoning: Gemini vs presence per difficulty
-# Easy: presence only (Gemini std=0.076, no discrimination)
-EASY_GEMINI_WEIGHT = 0.0
-EASY_PRESENCE_WEIGHT = 1.0
+# Easy: include Gemini so easy-tier reasoning is not scored by presence alone.
+EASY_GEMINI_WEIGHT = 0.3
+EASY_PRESENCE_WEIGHT = 0.7
 # Medium: 70% Gemini (std=0.16, confirmed reliable)
 MEDIUM_GEMINI_WEIGHT = 0.7
 MEDIUM_PRESENCE_WEIGHT = 0.3

@@ -151,7 +151,7 @@ def test_tier_weights():
     from reward.reward import _get_tier_weights, _get_source_weights
 
     g, p = _get_tier_weights("easy")
-    assert g == 0.0 and p == 1.0
+    assert g == 0.3 and p == 0.7
     print(f"  easy: gemini={g}, presence={p}")
 
     g, p = _get_tier_weights("medium")
@@ -215,8 +215,8 @@ def test_execution_sandbox():
 
 
 def test_reward_fn_easy():
-    """End-to-end reward_fn test with easy problems (no Gemini needed)."""
-    print("\n--- Testing reward_fn (easy, no Gemini) ---")
+    """End-to-end reward_fn test with easy problems (Gemini + presence reasoning)."""
+    print("\n--- Testing reward_fn (easy, Gemini + presence reasoning) ---")
     from reward.reward import reward_fn
 
     problem = {
@@ -263,8 +263,8 @@ def test_reward_fn_easy():
     assert rewards[0] > 0.5, "Good should be > 0.5"
 
     # Verify APPS weighting: exec=0.75, reasoning=0.25
-    # Good: exec=1.0, presence=1.0 (6 valid steps, easy → presence only)
-    # Expected: 0.75*1.0 + 0.25*1.0 = 1.0
+    # Good: exec=1.0, high reasoning score expected (easy uses Gemini + presence)
+    # If Gemini is unavailable in local tests, fallback can reduce this slightly.
     print(f"  expected good ~1.0, got {rewards[0]:.3f}")
 
 

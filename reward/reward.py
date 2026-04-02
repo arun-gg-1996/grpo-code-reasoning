@@ -8,7 +8,7 @@ Reward structure (per spec):
     LCB:   final = 0.60 * exec + 0.40 * reasoning
 
 Reasoning scoring tiers:
-    Easy:   presence heuristic only (Gemini std=0.076, no discrimination)
+    Easy:   0.7 * presence + 0.3 * gemini
     Medium: 0.3 * presence + 0.7 * gemini
     Hard:   0.7 * presence + 0.3 * gemini
 
@@ -181,7 +181,7 @@ def reward_fn(
     presence_scores = [_presence_score(tb) for tb in think_blocks]
 
     # ------------------------------------------------------------------
-    # Step 4: Gemini judge for medium/hard with think blocks
+    # Step 4: Gemini judge for all difficulty tiers with think blocks
     # ------------------------------------------------------------------
     # Collect indices that need Gemini calls
     gemini_indices = []
@@ -190,7 +190,7 @@ def reward_fn(
     gemini_diffs = []
 
     for i in range(n):
-        if think_blocks[i] and difficulties[i] in ("medium", "hard"):
+        if think_blocks[i]:
             gemini_indices.append(i)
             gemini_problems.append(problems[i].get("question", ""))
             gemini_thinks.append(think_blocks[i])
