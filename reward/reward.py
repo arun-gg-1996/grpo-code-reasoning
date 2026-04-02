@@ -403,6 +403,16 @@ def _log_metrics(
             "data/easy_seen": len(_seen_by_diff.get("easy", set())),
             "data/medium_seen": len(_seen_by_diff.get("medium", set())),
             "data/hard_seen": len(_seen_by_diff.get("hard", set())),
+            # Gemini stats (default zeros so charts exist even when no judge calls happen)
+            "judge/gemini_mean": 0.0,
+            "judge/gemini_calls": 0,
+            "judge/total_calls": 0,
+            "judge/fallback_count": 0,
+            "judge/fallback_fraction": 0.0,
+            "judge/step_json_count": 0,
+            "judge/step_json_fraction": 0.0,
+            "judge/retry_count": 0,
+            "judge/rate_limit_count": 0,
         }
         if timing:
             log_dict.update(timing)

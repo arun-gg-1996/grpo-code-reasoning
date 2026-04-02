@@ -11,11 +11,12 @@ Pin:
 - `grpo/reward_std_mean`
 - `grpo/all_zero_fraction`
 - `grpo/all_perfect_fraction`
-- `train/kl`
+- `kl` (or `train/kl` depending TRL/W&B naming)
 
 Read:
 - `grpo/reward_std_mean` near 0 means weak GRPO contrast.
 - high `grpo/all_zero_fraction` means collapse on current distribution.
+- if `kl` is missing, try pinning `train/kl` or `objective/kl`.
 
 ## Section 2: Execution Health
 
@@ -85,6 +86,7 @@ Pin:
 
 Read:
 - spikes here are expected at save/push boundaries.
+- `event/hf_push_s` appears only when push-to-hub is enabled and a push happens.
 
 ## Section 7: Warning Flags
 
@@ -103,4 +105,3 @@ Pin all warning flags:
 
 Read:
 - investigate immediately when any warning flag stays at `1` for multiple steps.
-

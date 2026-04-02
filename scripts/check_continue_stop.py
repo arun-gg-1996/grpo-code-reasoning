@@ -31,6 +31,15 @@ def _series(history, key: str) -> List[float]:
     return vals
 
 
+def _series_any(history, keys: List[str]) -> List[float]:
+    """Return first non-empty numeric series from candidate keys."""
+    for key in keys:
+        vals = _series(history, key)
+        if vals:
+            return vals
+    return []
+
+
 def _rolling_mean(values: List[float], window: int) -> float | None:
     if len(values) < window or window <= 0:
         return None
@@ -70,10 +79,11 @@ def evaluate(
         "trunc_frac": "gen/likely_truncated_fraction",
         "timeout_frac": "exec/timeout_fraction",
         "reward_std": "grpo/reward_std_mean",
-        "kl": "train/kl",
     }
 
     series = {name: _series(history, k) for name, k in keys.items()}
+    # KL key names vary across trainer/library versions.
+    series["kl"] = _series_any(history, ["train/kl", "kl", "objective/kl"])
     stats = {name: _rolling_mean(vals, window) for name, vals in series.items()}
     counts = {name: len(vals) for name, vals in series.items()}
     exec_trend = _window_trend(series["exec_mean"], window)
