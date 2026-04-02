@@ -53,7 +53,9 @@ def _fmt(v: float | None) -> str:
     return f"{v:.4f}"
 
 
-def evaluate(run_path: str, window: int) -> Tuple[bool, Dict[str, float | None], List[str], List[str]]:
+def evaluate(
+    run_path: str, window: int
+) -> Tuple[bool, bool, Dict[str, float | None], Dict[str, int], List[str], List[str]]:
     api = wandb.Api()
     run = api.run(run_path)
 
@@ -73,24 +75,41 @@ def evaluate(run_path: str, window: int) -> Tuple[bool, Dict[str, float | None],
 
     series = {name: _series(history, k) for name, k in keys.items()}
     stats = {name: _rolling_mean(vals, window) for name, vals in series.items()}
+    counts = {name: len(vals) for name, vals in series.items()}
     exec_trend = _window_trend(series["exec_mean"], window)
     zero_trend = _window_trend(series["zero_frac"], window)
     kl_vals = series["kl"]
 
     continue_rules = []
     stop_rules = []
+    limited_data = False
 
     # Continue rules
     if stats["exec_mean"] is not None and exec_trend is not None:
         continue_rules.append(stats["exec_mean"] >= 0.22 and exec_trend >= -0.02)
     else:
-        continue_rules.append(False)
+        limited_data = True
 
-    continue_rules.append(stats["zero_frac"] is not None and stats["zero_frac"] <= 0.70)
-    continue_rules.append(stats["valid_frac"] is not None and stats["valid_frac"] >= 0.75)
-    continue_rules.append(stats["trunc_frac"] is not None and stats["trunc_frac"] <= 0.08)
-    continue_rules.append(stats["timeout_frac"] is not None and stats["timeout_frac"] <= 0.08)
-    continue_rules.append(stats["reward_std"] is not None and stats["reward_std"] >= 0.08)
+    if stats["zero_frac"] is not None:
+        continue_rules.append(stats["zero_frac"] <= 0.70)
+    else:
+        limited_data = True
+    if stats["valid_frac"] is not None:
+        continue_rules.append(stats["valid_frac"] >= 0.75)
+    else:
+        limited_data = True
+    if stats["trunc_frac"] is not None:
+        continue_rules.append(stats["trunc_frac"] <= 0.08)
+    else:
+        limited_data = True
+    if stats["timeout_frac"] is not None:
+        continue_rules.append(stats["timeout_frac"] <= 0.08)
+    else:
+        limited_data = True
+    if stats["reward_std"] is not None:
+        continue_rules.append(stats["reward_std"] >= 0.08)
+    else:
+        limited_data = True
 
     # KL "stable" check: latest window mean should not be >3x previous window mean.
     kl_stable = False
@@ -98,7 +117,10 @@ def evaluate(run_path: str, window: int) -> Tuple[bool, Dict[str, float | None],
         prev = sum(kl_vals[-2 * window : -window]) / window
         curr = sum(kl_vals[-window:]) / window
         kl_stable = curr <= (3.0 * max(prev, 1e-9))
-    continue_rules.append(kl_stable)
+    if len(kl_vals) >= 2 * window:
+        continue_rules.append(kl_stable)
+    else:
+        limited_data = True
 
     # Stop rules
     stop_rules.append(stats["zero_frac"] is not None and stats["zero_frac"] > 0.85)
@@ -112,6 +134,7 @@ def evaluate(run_path: str, window: int) -> Tuple[bool, Dict[str, float | None],
     reasons_bad = []
 
     reasons_ok.append(f"window={window}")
+    reasons_ok.append("sample_counts=" + ", ".join(f"{k}:{counts[k]}" for k in sorted(counts)))
     reasons_ok.append(f"execution_mean={_fmt(stats['exec_mean'])} trend={_fmt(exec_trend)}")
     reasons_ok.append(f"zero_fraction={_fmt(stats['zero_frac'])} trend={_fmt(zero_trend)}")
     reasons_ok.append(f"valid_code_fraction={_fmt(stats['valid_frac'])}")
@@ -132,11 +155,12 @@ def evaluate(run_path: str, window: int) -> Tuple[bool, Dict[str, float | None],
         reasons_bad.append("timeout_fraction too high (>0.15)")
     if stats["reward_std"] is not None and stats["reward_std"] < 0.03:
         reasons_bad.append("reward_std_mean collapsed (<0.03)")
-    if not kl_stable:
+    if len(kl_vals) >= 2 * window and not kl_stable:
         reasons_bad.append("KL is unstable or insufficient data to verify stability")
 
-    should_continue = all(continue_rules) and not any(stop_rules)
-    return should_continue, stats, reasons_ok, reasons_bad
+    hard_stop = any(stop_rules)
+    should_continue = (not hard_stop) and all(continue_rules)
+    return should_continue, limited_data, stats, counts, reasons_ok, reasons_bad
 
 
 def main() -> None:
@@ -148,7 +172,9 @@ def main() -> None:
     args = parser.parse_args()
 
     run_path = f"{args.entity}/{args.project}/{args.run}"
-    should_continue, _, reasons_ok, reasons_bad = evaluate(run_path=run_path, window=args.window)
+    should_continue, limited_data, _, _, reasons_ok, reasons_bad = evaluate(
+        run_path=run_path, window=args.window
+    )
 
     print(f"Run: {run_path}")
     print("Metrics (rolling window):")
@@ -160,13 +186,18 @@ def main() -> None:
         print("  CONTINUE")
         print("  Reason: metrics are inside the healthy range.")
     else:
-        print("  STOP")
         if reasons_bad:
+            print("  STOP")
             print("  Reasons:")
             for r in reasons_bad:
                 print(f"  - {r}")
         else:
-            print("  Reasons: insufficient data for some checks; review run manually.")
+            if limited_data:
+                print("  CONTINUE (limited trend data)")
+                print("  Reason: no hard-stop conditions triggered, but some trend checks need more points.")
+            else:
+                print("  STOP")
+                print("  Reasons: some continue checks failed; review run manually.")
 
 
 if __name__ == "__main__":
