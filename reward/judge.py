@@ -13,6 +13,7 @@ All batch calls are concurrent via asyncio.gather.
 import asyncio
 import json
 import logging
+import math
 import random
 import re
 from typing import Optional
@@ -40,18 +41,28 @@ _last_batch_stats = {
     "total_calls": 0,
     "fallback_count": 0,
     "fallback_fraction": 0.0,
+    "json_count": 0,
+    "json_fraction": 0.0,
+    # Backward-compatible aliases.
+    "step_json_count": 0,
+    "step_json_fraction": 0.0,
     "retry_count": 0,
     "rate_limit_count": 0,
+    "fallback_mask": [],
+    "consecutive_rate_limit_steps": 0,
 }
+_consecutive_rate_limit_steps = 0
 
 
 def _build_request_body(problem: str, think_block: str, difficulty: str) -> dict:
     user_prompt = (
         "Evaluate this reasoning trace for a competitive programming problem.\n"
+        "Evaluate all [STEP] blocks present (variable number of steps).\n"
+        "Do not reward verbosity. Penalize repetition, filler, and redundant restatement.\n"
+        "Reward correctness and useful technical progress only.\n"
         "Return ONLY valid JSON with this exact schema:\n"
-        "{\"step_scores\": [s1, s2, s3, s4, s5, s6], \"overall\": o}\n"
+        "{\"overall\": o}\n"
         "Rules:\n"
-        "- step_scores must contain exactly 6 floats in [0.0, 1.0]\n"
         "- overall must be a float in [0.0, 1.0]\n"
         "- no markdown, no prose, no extra keys\n\n"
         f"Difficulty: {difficulty}\n\n"
@@ -75,20 +86,27 @@ def parse_judge_response(text: str) -> Optional[dict]:
     Parse Gemini judge response.
     Handles two formats:
       - Plain float: "0.85"
-      - JSON: {"step_scores": [...], "overall": 0.85}
+      - JSON: {"overall": 0.85} or {"step_scores": [...], "overall": 0.85}
     Returns dict with "overall" key, or None on failure.
     """
+    def _unit_or_none(x) -> Optional[float]:
+        try:
+            val = float(x)
+        except Exception:
+            return None
+        if not math.isfinite(val):
+            return None
+        return max(0.0, min(1.0, val))
+
     try:
         text = text.strip().strip("`").strip()
         if text.startswith("json"):
             text = text[4:].strip()
 
-        # Try plain float first (current prompt format)
-        try:
-            overall = max(0.0, min(1.0, float(text)))
-            return {"overall": overall, "step_scores": []}
-        except ValueError:
-            pass
+        # Try plain float first (kept for backward compatibility)
+        overall = _unit_or_none(text)
+        if overall is not None:
+            return {"overall": overall, "step_scores": [], "_format": "float"}
 
         # Try JSON format
         try:
@@ -100,12 +118,17 @@ def parse_judge_response(text: str) -> Optional[dict]:
                 raise
             data = json.loads(m.group(0))
 
-        overall = max(0.0, min(1.0, float(data.get("overall", 0.5))))
+        overall = _unit_or_none(data.get("overall"))
+        if overall is None:
+            return None
         raw_steps = data.get("step_scores", [])
-        step_scores = [max(0.0, min(1.0, float(s))) for s in raw_steps[:6]]
-        if len(step_scores) < 6:
-            step_scores.extend([overall] * (6 - len(step_scores)))
-        return {"overall": overall, "step_scores": step_scores}
+        step_scores = []
+        for s in raw_steps:
+            val = _unit_or_none(s)
+            if val is None:
+                return None
+            step_scores.append(val)
+        return {"overall": overall, "step_scores": step_scores, "_format": "json"}
     except Exception as e:
         logger.warning(f"Failed to parse judge response: {e} | text: {text[:200]}")
         return None
@@ -118,7 +141,7 @@ async def _call_single(
     think_block: str,
     difficulty: str,
 ) -> tuple[float, bool, bool, int, int]:
-    """Single async Gemini call. Returns (score, used_fallback, used_step_scores)."""
+    """Single async Gemini call. Returns (score, used_fallback, used_json_response)."""
     body = _build_request_body(problem, think_block, difficulty)
     url = f"{VERTEX_URL}?key={api_key}"
     retry_count = 0
@@ -159,11 +182,12 @@ async def _call_single(
             text = data["candidates"][0]["content"]["parts"][0]["text"]
             parsed = parse_judge_response(text)
             if parsed is not None:
+                used_json = parsed.get("_format") == "json"
                 steps = parsed.get("step_scores", [])
                 if steps:
                     # Judge score is derived from per-step quality.
-                    return float(sum(steps) / len(steps)), False, True, retry_count, rate_limit_count
-                return parsed["overall"], False, False, retry_count, rate_limit_count
+                    return float(sum(steps) / len(steps)), False, used_json, retry_count, rate_limit_count
+                return parsed["overall"], False, used_json, retry_count, rate_limit_count
             return 0.5, True, False, retry_count, rate_limit_count
 
         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ReadError, httpx.ConnectError) as e:
@@ -218,7 +242,7 @@ def score_batch(
     Reads API key from GEMINI_API_KEY env var (set in config.py).
     Returns list of float scores 0.0-1.0 (0.5 on error).
     """
-    global _last_batch_stats
+    global _last_batch_stats, _consecutive_rate_limit_steps
     api_key = GEMINI_API_KEY
     if not api_key:
         logger.warning("GEMINI_API_KEY not set — returning 0.5 fallback for all")
@@ -227,27 +251,42 @@ def score_batch(
             "total_calls": n,
             "fallback_count": n,
             "fallback_fraction": 1.0 if n > 0 else 0.0,
+            "json_count": 0,
+            "json_fraction": 0.0,
+            # Backward-compatible aliases.
             "step_json_count": 0,
             "step_json_fraction": 0.0,
             "retry_count": 0,
             "rate_limit_count": 0,
+            "fallback_mask": [True] * n,
+            "consecutive_rate_limit_steps": 0,
         }
         return [0.5] * len(problems)
 
     triples = asyncio.run(_score_batch_async(problems, think_blocks, difficulties, api_key))
     scores = [s for s, _, _, _, _ in triples]
     fallback_count = sum(1 for _, used_fallback, _, _, _ in triples if used_fallback)
-    step_json_count = sum(1 for _, _, used_steps, _, _ in triples if used_steps)
+    json_count = sum(1 for _, _, used_json, _, _ in triples if used_json)
     retry_count = sum(retries for _, _, _, retries, _ in triples)
     rate_limit_count = sum(rl for _, _, _, _, rl in triples)
+    fallback_mask = [used_fallback for _, used_fallback, _, _, _ in triples]
     total = len(triples)
+    if rate_limit_count > 0:
+        _consecutive_rate_limit_steps += 1
+    else:
+        _consecutive_rate_limit_steps = 0
     _last_batch_stats = {
         "total_calls": total,
         "fallback_count": fallback_count,
         "fallback_fraction": (fallback_count / total) if total > 0 else 0.0,
-        "step_json_count": step_json_count,
-        "step_json_fraction": (step_json_count / total) if total > 0 else 0.0,
+        "json_count": json_count,
+        "json_fraction": (json_count / total) if total > 0 else 0.0,
+        # Backward-compatible aliases.
+        "step_json_count": json_count,
+        "step_json_fraction": (json_count / total) if total > 0 else 0.0,
         "retry_count": retry_count,
         "rate_limit_count": rate_limit_count,
+        "fallback_mask": fallback_mask,
+        "consecutive_rate_limit_steps": _consecutive_rate_limit_steps,
     }
     return scores

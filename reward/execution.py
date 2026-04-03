@@ -17,7 +17,13 @@ import io
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
-from config import EXEC_TIMEOUT as SUBPROCESS_TIMEOUT, EXEC_WORKERS as POOL_WORKERS, MAX_TEST_CASES
+from config import (
+    EXEC_TIMEOUT as SUBPROCESS_TIMEOUT,
+    EXEC_WORKERS as POOL_WORKERS,
+    MAX_TEST_CASES,
+    SANDBOX_PER_TEST_TIMEOUT_S,
+    SANDBOX_MAX_MEMORY_MB,
+)
 from problem_format import get_function_name, is_function_style_problem
 
 sys.set_int_max_str_digits(100000)
@@ -29,6 +35,35 @@ sys.set_int_max_str_digits(100000)
 # ─────────────────────────────────────────
 _batch_pool: Optional[ThreadPoolExecutor] = None
 _batch_pool_workers: Optional[int] = None
+
+
+def _sandbox_memory_bytes() -> Optional[int]:
+    if SANDBOX_MAX_MEMORY_MB is None or SANDBOX_MAX_MEMORY_MB <= 0:
+        return None
+    return int(SANDBOX_MAX_MEMORY_MB * 1024 * 1024)
+
+
+def _apply_memory_limit_safely(max_bytes: Optional[int]) -> None:
+    """Apply RLIMIT safely without raising if the host has stricter hard limits."""
+    if max_bytes is None:
+        return
+    try:
+        import resource
+
+        def _set_cap(which):
+            soft, hard = resource.getrlimit(which)
+            cap = max_bytes
+            if hard not in (-1, resource.RLIM_INFINITY):
+                cap = min(cap, int(hard))
+            if soft not in (-1, resource.RLIM_INFINITY):
+                cap = min(cap, int(soft))
+            resource.setrlimit(which, (cap, cap))
+
+        _set_cap(resource.RLIMIT_AS)
+        _set_cap(resource.RLIMIT_DATA)
+    except Exception:
+        # Best-effort hardening; never fail scoring because of RLIMIT setup.
+        return
 
 
 def _get_batch_pool(n_workers: int) -> ThreadPoolExecutor:
@@ -51,7 +86,19 @@ def _stdio_worker(solution: str, test_cases: list, result_queue):
     try:
         # local import — keeps reliability_guard damage inside this process
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        from sandbox.testing_util import run_test
+        import sandbox.testing_util as testing_util
+
+        # Set per-test timeout explicitly from config.
+        testing_util.timeout = int(SANDBOX_PER_TEST_TIMEOUT_S)
+        # Ensure run_test's internal reliability_guard enforces RLIMIT memory.
+        mem_bytes = _sandbox_memory_bytes()
+        _orig_guard = testing_util.reliability_guard
+
+        def _guard_with_mem(_unused=None):
+            _apply_memory_limit_safely(mem_bytes)
+            return _orig_guard(maximum_memory_bytes=None)
+
+        testing_util.reliability_guard = _guard_with_mem
 
         io_payload = {
             "inputs": [tc["input"] for tc in test_cases],
@@ -60,7 +107,7 @@ def _stdio_worker(solution: str, test_cases: list, result_queue):
         # Suppress verbose checker prints (failed checks, runtime traces) from child process.
         with open(os.devnull, "w") as devnull:
             with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-                results = run_test(problem={"input_output": io_payload}, test=solution)
+                results = testing_util.run_test(problem={"input_output": io_payload}, test=solution)
         score = sum(1 for r in results if r is True) / len(results) if results else 0.0
         result_queue.put(("ok", score))
     except Exception as e:
@@ -121,7 +168,19 @@ def _functional_worker(solution: str, func_name: str, test_cases: list, result_q
     sys.set_int_max_str_digits(100000)
     try:
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        from sandbox.testing_util import run_test
+        import sandbox.testing_util as testing_util
+
+        # Set per-test timeout explicitly from config.
+        testing_util.timeout = int(SANDBOX_PER_TEST_TIMEOUT_S)
+        # Ensure run_test's internal reliability_guard enforces RLIMIT memory.
+        mem_bytes = _sandbox_memory_bytes()
+        _orig_guard = testing_util.reliability_guard
+
+        def _guard_with_mem(_unused=None):
+            _apply_memory_limit_safely(mem_bytes)
+            return _orig_guard(maximum_memory_bytes=None)
+
+        testing_util.reliability_guard = _guard_with_mem
 
         parsed_inputs = []
         parsed_outputs = []
@@ -140,7 +199,7 @@ def _functional_worker(solution: str, func_name: str, test_cases: list, result_q
         # Suppress verbose checker prints (failed checks, runtime traces) from child process.
         with open(os.devnull, "w") as devnull:
             with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-                results = run_test(problem={"input_output": io_payload}, test=solution)
+                results = testing_util.run_test(problem={"input_output": io_payload}, test=solution)
         score = sum(1 for r in results if r is True) / len(results) if results else 0.0
         result_queue.put(("ok", score))
     except Exception as e:
@@ -314,7 +373,7 @@ def score_batch(
 # Code extraction
 # ─────────────────────────────────────────
 
-def extract_code(response: str) -> Optional[str]:
+def extract_code(response: str, strict_code_tags: bool = False) -> Optional[str]:
     """
     Extract code from model response.
     Expects <code>...</code> tags.
@@ -355,6 +414,8 @@ def extract_code(response: str) -> Optional[str]:
     match = re.search(r"<code>(.*?)</code>", response, re.DOTALL)
     if match:
         return _strip_markdown_fences(match.group(1))
+    if strict_code_tags:
+        return None
     # fallback: ```python blocks
     match = re.search(r"```python\s*(.*?)```", response, re.DOTALL)
     if match:

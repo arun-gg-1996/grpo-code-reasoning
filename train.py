@@ -38,6 +38,7 @@ from trl import GRPOConfig, GRPOTrainer
 from config import (
     TRAINING_MODEL,
     LOCAL_TRAINING_MODEL,
+    ATTN_IMPLEMENTATION,
     TRAINING_SYSTEM_PROMPT,
     LORA_RANK,
     LORA_ALPHA,
@@ -46,6 +47,7 @@ from config import (
     GROUP_SIZE,
     BATCH_SIZE,
     MAX_NEW_TOKENS,
+    MAX_PROMPT_LENGTH,
     ROLLOUT_TEMPERATURE,
     LEARNING_RATE,
     KL_COEFF,
@@ -53,6 +55,11 @@ from config import (
     MAX_TRAINING_STEPS,
     GRADIENT_ACCUMULATION_STEPS,
     VLLM_GPU_MEMORY_UTILIZATION,
+    VLLM_MODE,
+    TRAIN_SEED,
+    GENERATION_BATCH_SIZE,
+    VLLM_ENABLE_SLEEP_MODE,
+    STRICT_TRAIN_CODE_TAGS,
     APPS_CLEAN_PATH,
     LCB_SEEN_PATH,
     SAVE_STEPS,
@@ -131,18 +138,28 @@ def build_prompt(problem: dict) -> str:
     if is_func_style:
         fn_line = f"- Implement the expected function `{func_name}` exactly.\n" if func_name else ""
         format_hint = (
-            "Output format requirement:\n"
-            "- This is a function-style problem.\n"
+            "Output format requirement (strict):\n"
+            "- Output exactly one <think>...</think> block, then exactly one <code>...</code> block.\n"
+            "- Do not output any text before <think> or after </code>.\n"
+            "- In <think>, the first [STEP] must decide execution format and signature for this problem.\n"
+            "- Use as many [STEP] blocks as needed; keep them concise and avoid filler/repetition.\n"
+            "- This problem is function-style.\n"
             "- In <code>...</code>, provide only the function/class implementation expected by the prompt.\n"
             f"{fn_line}"
             "- Do NOT read from stdin and do NOT print to stdout unless explicitly required by the statement.\n"
+            "- Never leave <code> empty.\n"
             "- Inside <code>, output raw Python only (no triple backticks)."
         )
     else:
         format_hint = (
-            "Output format requirement:\n"
-            "- This is a stdin/stdout problem.\n"
+            "Output format requirement (strict):\n"
+            "- Output exactly one <think>...</think> block, then exactly one <code>...</code> block.\n"
+            "- Do not output any text before <think> or after </code>.\n"
+            "- In <think>, the first [STEP] must decide execution format and I/O handling for this problem.\n"
+            "- Use as many [STEP] blocks as needed; keep them concise and avoid filler/repetition.\n"
+            "- This problem is stdin/stdout style.\n"
             "- In <code>...</code>, provide a full program that reads input from stdin and prints output.\n"
+            "- Never leave <code> empty.\n"
             "- Inside <code>, output raw Python only (no triple backticks)."
         )
 
@@ -431,6 +448,12 @@ def main():
         default=None,
         help="Override per-device train batch size.",
     )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        type=str,
+        default=None,
+        help="Checkpoint path to resume from, or 'latest' to auto-resume latest in output_dir.",
+    )
     args = parser.parse_args()
 
     # Smoke test overrides
@@ -481,6 +504,16 @@ def main():
             raise ValueError("--max-new-tokens must be > 0")
         max_new_tokens = args.max_new_tokens
 
+    # Derived runtime knobs (must follow CLI overrides above).
+    grad_accum_steps = GRADIENT_ACCUMULATION_STEPS if not args.smoke_test else 1
+    effective_vllm_max_model_length = MAX_PROMPT_LENGTH + max_new_tokens
+
+    # Reproducibility for curriculum prebuild order and sampling.
+    random.seed(TRAIN_SEED)
+    torch.manual_seed(TRAIN_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(TRAIN_SEED)
+
     # Timestamped train artifacts (similar to eval run folders)
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     train_run_dir = os.path.join(args.train_artifacts_dir, run_ts)
@@ -505,12 +538,20 @@ def main():
             "max_steps": max_steps,
             "batch_size": batch_size,
             "group_size": group_size,
+            "generation_batch_size": min(GENERATION_BATCH_SIZE, batch_size * group_size),
             "lr": LEARNING_RATE,
             "kl_coeff": KL_COEFF,
             "rollout_temperature": rollout_temperature,
             "max_new_tokens": max_new_tokens,
             "vllm_gpu_memory_utilization": vllm_mem,
+            "vllm_mode": VLLM_MODE,
+            "vllm_max_model_length": effective_vllm_max_model_length,
+            "vllm_enable_sleep_mode": VLLM_ENABLE_SLEEP_MODE,
+            "attn_implementation": ATTN_IMPLEMENTATION,
             "lora_rank": LORA_RANK,
+            "train_seed": TRAIN_SEED,
+            "strict_train_code_tags": STRICT_TRAIN_CODE_TAGS,
+            "resume_from_checkpoint": args.resume_from_checkpoint,
         })
 
     # Load data
@@ -531,9 +572,9 @@ def main():
     for d, ps in problems_by_diff.items():
         logger.info(f"  {d}: {len(ps)} problems")
 
-    # Pre-build curriculum dataset in strict step order.
-    # One row group per step, sampled with get_curriculum_weights(step).
-    # We keep this ordering at train time by setting shuffle_dataset=False below.
+    # Pre-build curriculum dataset in optimizer-step order.
+    # One row group per optimizer step. With shuffle_dataset=False, the trainer
+    # consumes rows in this exact order, so curriculum "step" matches global_step.
     logger.info("Building curriculum-weighted dataset...")
     all_sampled = []
     for step in range(max_steps):
@@ -549,7 +590,10 @@ def main():
         s = p.get("source", "unknown")
         diff_counts[d] = diff_counts.get(d, 0) + 1
         src_counts[s] = src_counts.get(s, 0) + 1
-    logger.info(f"Dataset: {len(dataset)} rows ({max_steps} steps × {batch_size} problems/step)")
+    logger.info(
+        "Dataset: %d rows (%d optimizer steps × %d problems/step)",
+        len(dataset), max_steps, batch_size
+    )
     for d, c in sorted(diff_counts.items()):
         logger.info(f"  difficulty: {d}={c} ({c / len(all_sampled):.1%})")
     for s, c in sorted(src_counts.items()):
@@ -576,16 +620,19 @@ def main():
         num_train_epochs=1,
         max_steps=max_steps,
         per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS if not args.smoke_test else 1,
+        gradient_accumulation_steps=grad_accum_steps,
         learning_rate=LEARNING_RATE,
+        lr_scheduler_type="cosine",
         warmup_steps=WARMUP_STEPS if not args.smoke_test else 2,
+        max_prompt_length=MAX_PROMPT_LENGTH,
         max_completion_length=max_new_tokens,
         num_generations=group_size,
-        generation_batch_size=batch_size * group_size,
+        generation_batch_size=min(GENERATION_BATCH_SIZE, batch_size * group_size),
         temperature=rollout_temperature,
         beta=KL_COEFF,
         logging_steps=LOGGING_STEPS,
         save_steps=save_steps,
+        seed=TRAIN_SEED,
         report_to="wandb" if use_wandb else "none",
         gradient_checkpointing=not args.smoke_test,
         bf16=(not args.smoke_test) or (args.smoke_test and smoke_use_gpu),
@@ -593,10 +640,17 @@ def main():
         model_init_kwargs=(
             {"torch_dtype": "float32", "device_map": "cpu"}
             if (args.smoke_test and (not smoke_use_gpu))
-            else None
+            else (
+                {"attn_implementation": ATTN_IMPLEMENTATION, "torch_dtype": torch.bfloat16}
+                if not args.smoke_test
+                else None
+            )
         ),
         use_vllm=(not args.smoke_test) or (args.smoke_test and smoke_use_vllm),
+        vllm_mode=VLLM_MODE,
         vllm_gpu_memory_utilization=vllm_mem,
+        vllm_max_model_length=effective_vllm_max_model_length,
+        vllm_enable_sleep_mode=VLLM_ENABLE_SLEEP_MODE,
         shuffle_dataset=False,
         push_to_hub=PUSH_TO_HUB and not args.smoke_test,
         hub_model_id=HUB_MODEL_ID if (PUSH_TO_HUB and not args.smoke_test) else None,
@@ -626,9 +680,17 @@ def main():
         "max_steps": int(max_steps),
         "batch_size": int(batch_size),
         "group_size": int(group_size),
+        "generation_batch_size": int(min(GENERATION_BATCH_SIZE, batch_size * group_size)),
         "rollout_temperature": float(rollout_temperature),
         "max_new_tokens": int(max_new_tokens),
+        "train_seed": int(TRAIN_SEED),
         "vllm_gpu_memory_utilization": float(vllm_mem),
+        "vllm_mode": VLLM_MODE,
+        "vllm_max_model_length": int(effective_vllm_max_model_length),
+        "vllm_enable_sleep_mode": bool(VLLM_ENABLE_SLEEP_MODE),
+        "attn_implementation": ATTN_IMPLEMENTATION,
+        "strict_train_code_tags": bool(STRICT_TRAIN_CODE_TAGS),
+        "resume_from_checkpoint": args.resume_from_checkpoint,
         "save_debug_details": bool(args.save_debug_details and (not args.smoke_test)),
         "train_debug_details_path": (
             os.path.abspath(train_debug_path)
@@ -640,7 +702,13 @@ def main():
         json.dump(run_summary, f, indent=2)
 
     try:
-        trainer.train()
+        resume_arg = args.resume_from_checkpoint
+        if resume_arg is not None and resume_arg.strip().lower() == "latest":
+            resume_arg = True
+        if resume_arg is None:
+            trainer.train()
+        else:
+            trainer.train(resume_from_checkpoint=resume_arg)
         run_summary["status"] = "completed"
     except Exception as e:
         run_summary["status"] = "failed"

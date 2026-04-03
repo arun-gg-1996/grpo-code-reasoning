@@ -1,162 +1,154 @@
-# Pre-Train Checklist (Operator Reference)
+# Pre-Train Checklist (A100 Operator Quick Reference)
 
-This file is the command-focused companion to `README.md`.
+Use this before every run.
 
-If you want one command, use:
-
-```bash
-bash scripts/pretrain_checks.sh
-```
-
----
-
-## Required Before Every Training Run
+## One Command Path
 
 ```bash
 source venv/bin/activate
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 bash scripts/pretrain_checks.sh
 ```
 
-Pass condition: script exits 0 and prints `All pre-train checks passed.`
+Pass condition: exit code `0` and message `All pre-train checks passed.`
 
----
+## Toggle Modes
 
-## Manual Equivalent (If You Prefer Step-By-Step)
+```bash
+# Skip live Gemini API probe
+SKIP_GEMINI=1 bash scripts/pretrain_checks.sh
 
-### 1) Environment + GPU
+# Include trainer smoke run
+RUN_TRAIN_SMOKE=1 bash scripts/pretrain_checks.sh
+
+# Strict env checks
+PRETRAIN_STRICT_ENV=1 bash scripts/pretrain_checks.sh
+PRETRAIN_STRICT_TORCH=1 bash scripts/pretrain_checks.sh
+```
+
+## Manual Equivalent (Step-by-Step)
+
+### 1) GPU and torch
 
 ```bash
 python --version
-python -c "import torch; print('CUDA:', torch.cuda.is_available(), '| Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+python - <<'PY'
+import torch
+print("cuda_available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("cuda_device:", torch.cuda.get_device_name(0))
+PY
 nvidia-smi
 ```
 
-### 2) Data Presence
+### 2) Data files present
 
 ```bash
 python - <<'PY'
 import os
 from config import APPS_CLEAN_PATH, LCB_SEEN_PATH, LCB_EVAL_PATH
 for label, path in [
-    ('APPS', APPS_CLEAN_PATH),
-    ('LCB train', LCB_SEEN_PATH),
-    ('LCB eval', LCB_EVAL_PATH),
+    ("APPS", APPS_CLEAN_PATH),
+    ("LCB train", LCB_SEEN_PATH),
+    ("LCB eval", LCB_EVAL_PATH),
 ]:
     ok = os.path.exists(path)
-    print(f'{label}: {path} -> {"OK" if ok else "MISSING"}')
-    assert ok, f'Missing {path}'
-print('data_paths: PASS')
+    print(f"{label}: {path} -> {'OK' if ok else 'MISSING'}")
+    assert ok, f"Missing: {path}"
+print("data paths: PASS")
 PY
 ```
 
-### 3) Core Smoke Test
+### 3) Core smoke
 
 ```bash
 python smoke_test.py
 ```
 
-### 4) Live Gemini Check
+### 4) Live Gemini probe
 
 ```bash
 python - <<'PY'
 from reward.judge import score_batch, get_last_batch_stats
-problems = ['Print hello world', 'Given integer n, print n squared']
+problems = ["Print hello world", "Given integer n, print n squared"]
 thinks = [
-    '[STEP] Print a constant string to stdout.',
-    '[STEP] Read n, compute n*n, print result.',
+    "[STEP] Print a constant string to stdout.",
+    "[STEP] Read n, compute n*n, print result.",
 ]
-difficulties = ['medium', 'medium']
+difficulties = ["medium", "medium"]
 scores = score_batch(problems, thinks, difficulties)
 stats = get_last_batch_stats()
-print('gemini_score:', scores)
-print('gemini_stats:', stats)
+print("scores:", scores)
+print("stats:", stats)
 assert len(scores) == len(problems)
 assert all(0.0 <= s <= 1.0 for s in scores)
-assert stats.get('fallback_fraction', 1.0) < 1.0
-print('gemini_check: PASS')
+assert stats.get("fallback_fraction", 1.0) < 1.0
+print("gemini probe: PASS")
 PY
 ```
 
-### 5) Optional Trainer Smoke
+## Train / Resume
+
+Start new run:
 
 ```bash
-python train.py --smoke-test
+python train.py
 ```
 
----
-
-## Start Training
-
-Default:
+Resume latest checkpoint:
 
 ```bash
-python train.py --save-debug-details
+python train.py --resume-from-checkpoint latest
 ```
 
-Recommended stabilization config:
+Resume specific checkpoint:
 
 ```bash
-python train.py \
-  --save-debug-details \
-  --batch-size 2 \
-  --rollout-temperature 0.7 \
-  --vllm-gpu-memory-utilization 0.25 \
-  --max-new-tokens 2048
+python train.py --resume-from-checkpoint checkpoints/Qwen2.5-Coder-7B-Instruct-grpo/checkpoint-800
 ```
 
----
+## Eval Commands
 
-## Evaluate Baseline / Checkpoints
-
-Baseline:
+Base model:
 
 ```bash
 python eval.py \
   --model Qwen/Qwen2.5-Coder-7B-Instruct \
-  --output-dir results/eval \
+  --output-dir results/eval_base \
   --save-debug-details
 ```
 
-Checkpoint:
+Merged checkpoint:
 
 ```bash
 python eval.py \
-  --model checkpoints/Qwen2.5-Coder-7B-Instruct-grpo/checkpoint-2000 \
+  --model checkpoints/Qwen2.5-Coder-7B-Instruct-grpo/merged-checkpoint-800 \
   --output-dir results/eval \
   --save-debug-details
 ```
 
----
+## Useful Debug Helpers
 
-## Optional Stress / Diagnostics
-
-Execution stress:
-
-```bash
-python scripts/stress_execution.py --rounds-clean 10 --rounds-mixed 5 --batch-size 32 --workers 16 --timeout 5
-```
-
-Fence sanitization regression:
-
-```bash
-python scripts/test_fence_sanitization.py
-```
-
-Check continue/stop decision from W&B run:
+Continue/stop decision:
 
 ```bash
 python scripts/check_continue_stop.py \
   --entity <wandb-entity> \
   --project grpo-code-gen \
-  --run <run_id>
+  --run <run_id> \
+  --window 50 \
+  --baseline-start 700 \
+  --baseline-end 750
 ```
 
----
-
-## Pull Latest Artifacts
+Execution stress:
 
 ```bash
-bash scripts/pull_latest_train.sh
-bash scripts/pull_latest_eval.sh
+python scripts/stress_execution.py \
+  --rounds-clean 10 \
+  --rounds-mixed 5 \
+  --batch-size 32 \
+  --workers 16 \
+  --timeout 5
 ```
+

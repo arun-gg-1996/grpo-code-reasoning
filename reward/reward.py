@@ -7,10 +7,10 @@ Reward structure (per spec):
     APPS:  final = 0.75 * exec + 0.25 * reasoning
     LCB:   final = 0.60 * exec + 0.40 * reasoning
 
-Reasoning scoring tiers:
-    Easy:   0.7 * presence + 0.3 * gemini
-    Medium: 0.3 * presence + 0.7 * gemini
-    Hard:   0.7 * presence + 0.3 * gemini
+Reasoning scoring policy:
+    - Gemini-first for all tiers (when <think> exists and judge succeeds)
+    - simple presence fallback only when judge fails
+    - no <think> => reasoning score 0.0
 
 Data flow contract (DO NOT shuffle):
     completions[0:G] → problem 1, completions[G:2G] → problem 2, etc.
@@ -35,13 +35,10 @@ from config import (
     # Per-source weights
     APPS_EXEC_WEIGHT, APPS_REASONING_WEIGHT,
     LCB_EXEC_WEIGHT, LCB_REASONING_WEIGHT,
-    # Tier-weighted reasoning
-    EASY_GEMINI_WEIGHT, EASY_PRESENCE_WEIGHT,
-    MEDIUM_GEMINI_WEIGHT, MEDIUM_PRESENCE_WEIGHT,
-    HARD_GEMINI_WEIGHT, HARD_PRESENCE_WEIGHT,
     # Misc
     GROUP_SIZE,
     MAX_NEW_TOKENS,
+    STRICT_TRAIN_CODE_TAGS,
     normalize_difficulty,
 )
 from reward.execution import score_batch as exec_score_batch, extract_code, score_single
@@ -52,6 +49,9 @@ logger = logging.getLogger(__name__)
 _seen_problem_ids: set[str] = set()
 _seen_by_source: dict = {"apps": set(), "lcb_seen": set()}
 _seen_by_diff: dict = {"easy": set(), "medium": set(), "hard": set()}
+_processed_total = 0
+_processed_by_source: dict = {"apps": 0, "lcb_seen": 0}
+_processed_by_diff: dict = {"easy": 0, "medium": 0, "hard": 0}
 
 # Optional per-completion training debug stream (JSONL).
 _train_debug_inited = False
@@ -73,29 +73,54 @@ def _extract_think_block(completion: str) -> str:
 
 def _presence_score(think_block: str) -> float:
     """
-    Presence heuristic: count [STEP] markers with >=20 chars of content.
-    Score = valid_steps / 6.0, capped at 1.0.
+    Simple fallback score from <think> when Gemini fails.
+    Intentionally conservative to reduce reward hacking:
+      - reward: several meaningful [STEP] blocks
+      - penalty: very long traces and heavy repetition
     """
     if not think_block:
         return 0.0
 
-    # Split on [STEP] markers (case-insensitive)
     parts = re.split(r"\[STEP\]", think_block, flags=re.IGNORECASE)
-    # First element is text before the first [STEP], skip it
-    steps = parts[1:] if len(parts) > 1 else []
+    raw_steps = [s.strip() for s in (parts[1:] if len(parts) > 1 else []) if s.strip()]
+    if not raw_steps:
+        return 0.0
 
-    valid = sum(1 for s in steps[:6] if len(s.strip()) >= 20)
-    return min(valid / 6.0, 1.0)
+    meaningful = [s for s in raw_steps if 20 <= len(s) <= 1200]
+    base = min(len(meaningful) / 6.0, 1.0)
+
+    penalty = 0.0
+    total_chars = len(think_block)
+    if total_chars > 2600:
+        penalty += min(0.30, (total_chars - 2600) / 5000.0)
+
+    # Adjacent lexical overlap as simple repetition signal.
+    overlaps = []
+    for a_step, b_step in zip(raw_steps[:20], raw_steps[1:21]):
+        a = set(re.findall(r"[a-zA-Z]{4,}", a_step.lower()))
+        b = set(re.findall(r"[a-zA-Z]{4,}", b_step.lower()))
+        if not a or not b:
+            continue
+        union = len(a | b)
+        overlaps.append(len(a & b) / union)
+
+    if overlaps:
+        mean_overlap = float(np.mean(overlaps))
+        if mean_overlap > 0.75:
+            penalty += min(0.20, (mean_overlap - 0.75) * 0.8)
+
+    score = base - penalty
+    return float(max(0.0, min(1.0, score)))
 
 
 def _get_tier_weights(difficulty: str) -> tuple[float, float]:
-    """Return (gemini_weight, presence_weight) for a difficulty tier."""
+    """Deprecated: kept for backward compatibility with smoke tests."""
     if difficulty == "easy":
-        return EASY_GEMINI_WEIGHT, EASY_PRESENCE_WEIGHT
+        return 1.0, 0.0
     elif difficulty == "medium":
-        return MEDIUM_GEMINI_WEIGHT, MEDIUM_PRESENCE_WEIGHT
+        return 1.0, 0.0
     else:  # hard
-        return HARD_GEMINI_WEIGHT, HARD_PRESENCE_WEIGHT
+        return 1.0, 0.0
 
 
 def _get_source_weights(source: str) -> tuple[float, float]:
@@ -129,8 +154,29 @@ def reward_fn(
         list[float] of final rewards, ORDER PRESERVED.
     """
     n = len(completions)
-    problems = kwargs.get("problems", [{}] * n)
-    sources = kwargs.get("source", ["apps"] * n)
+    if n == 0:
+        return []
+
+    # Defensive alignment: preserve order and length expected by GRPO.
+    if len(prompts) != n:
+        logger.warning("reward_fn alignment: prompts=%d completions=%d", len(prompts), n)
+    problems = list(kwargs.get("problems", []))
+    sources = list(kwargs.get("source", []))
+    if len(problems) < n:
+        problems = problems + ([{}] * (n - len(problems)))
+    if len(sources) < n:
+        sources = sources + (["apps"] * (n - len(sources)))
+    problems = problems[:n]
+    sources = sources[:n]
+
+    # GRPO expects contiguous groups of G rollouts per problem.
+    if GROUP_SIZE > 0 and (n % GROUP_SIZE) != 0:
+        logger.warning(
+            "reward_fn group integrity warning: completions=%d not divisible by GROUP_SIZE=%d",
+            n, GROUP_SIZE
+        )
+
+    completions = [c if isinstance(c, str) else str(c) for c in completions]
 
     # Normalize difficulties
     difficulties = [
@@ -139,12 +185,17 @@ def reward_fn(
     ]
 
     # Track dataset coverage
+    global _processed_total
     for p, src, diff in zip(problems, sources, difficulties):
+        _processed_total += 1
+        src_key = "lcb_seen" if src in ("lcb", "lcb_seen") else "apps"
+        _processed_by_source[src_key] = _processed_by_source.get(src_key, 0) + 1
+        _processed_by_diff[diff] = _processed_by_diff.get(diff, 0) + 1
+
         pid = p.get("problem_id") or p.get("question_id", "")
         if pid:
             pid_str = str(pid)
             _seen_problem_ids.add(pid_str)
-            src_key = "lcb_seen" if src in ("lcb", "lcb_seen") else "apps"
             _seen_by_source.setdefault(src_key, set()).add(pid_str)
             _seen_by_diff.setdefault(diff, set()).add(pid_str)
 
@@ -153,7 +204,7 @@ def reward_fn(
     # ------------------------------------------------------------------
     # Step 1: Extract code and think blocks
     # ------------------------------------------------------------------
-    codes = [extract_code(c) or "" for c in completions]
+    codes = [extract_code(c, strict_code_tags=STRICT_TRAIN_CODE_TAGS) or "" for c in completions]
     think_blocks = [_extract_think_block(c) for c in completions]
 
     # ------------------------------------------------------------------
@@ -181,7 +232,7 @@ def reward_fn(
     presence_scores = [_presence_score(tb) for tb in think_blocks]
 
     # ------------------------------------------------------------------
-    # Step 4: Gemini judge for all difficulty tiers with think blocks
+    # Step 4: Gemini judge for all completions with think blocks
     # ------------------------------------------------------------------
     # Collect indices that need Gemini calls
     gemini_indices = []
@@ -202,14 +253,19 @@ def reward_fn(
     if gemini_indices:
         t_judge_start = time.perf_counter()
         try:
-            from reward.judge import score_batch as judge_score_batch
+            from reward.judge import score_batch as judge_score_batch, get_last_batch_stats
             raw_scores = judge_score_batch(
                 problems=gemini_problems,
                 think_blocks=gemini_thinks,
                 difficulties=gemini_diffs,
             )
-            for idx, score in zip(gemini_indices, raw_scores):
-                gemini_scores[idx] = score
+            judge_stats = get_last_batch_stats()
+            fallback_mask = judge_stats.get("fallback_mask", [])
+            for j, (idx, score) in enumerate(zip(gemini_indices, raw_scores)):
+                if j < len(fallback_mask) and fallback_mask[j]:
+                    gemini_scores[idx] = None
+                else:
+                    gemini_scores[idx] = score
         except Exception as e:
             logger.warning(f"Gemini batch call failed, falling back to presence: {e}")
         judge_time_s = time.perf_counter() - t_judge_start
@@ -221,22 +277,15 @@ def reward_fn(
     reasoning_scores = []
 
     for i in range(n):
-        diff = difficulties[i]
         source = sources[i]
 
-        # Reasoning score: tiered
+        # Reasoning score: Gemini-first; fallback to presence only on judge failure.
         if not think_blocks[i]:
-            # Case A: no <think> block
             reasoning_score = 0.0
+        elif gemini_scores[i] is not None:
+            reasoning_score = gemini_scores[i]
         else:
-            gem_w, pres_w = _get_tier_weights(diff)
-            if gem_w == 0.0 or gemini_scores[i] is None:
-                # Easy tier, or Gemini failed
-                reasoning_score = presence_scores[i]
-            else:
-                reasoning_score = (
-                    pres_w * presence_scores[i] + gem_w * gemini_scores[i]
-                )
+            reasoning_score = presence_scores[i]
 
         reasoning_scores.append(reasoning_score)
 
@@ -403,16 +452,26 @@ def _log_metrics(
             "data/easy_seen": len(_seen_by_diff.get("easy", set())),
             "data/medium_seen": len(_seen_by_diff.get("medium", set())),
             "data/hard_seen": len(_seen_by_diff.get("hard", set())),
+            "data/processed_total": _processed_total,
+            "data/apps_processed": _processed_by_source.get("apps", 0),
+            "data/lcb_processed": _processed_by_source.get("lcb_seen", 0),
+            "data/easy_processed": _processed_by_diff.get("easy", 0),
+            "data/medium_processed": _processed_by_diff.get("medium", 0),
+            "data/hard_processed": _processed_by_diff.get("hard", 0),
             # Gemini stats (default zeros so charts exist even when no judge calls happen)
             "judge/gemini_mean": 0.0,
             "judge/gemini_calls": 0,
             "judge/total_calls": 0,
             "judge/fallback_count": 0,
             "judge/fallback_fraction": 0.0,
+            "judge/json_count": 0,
+            "judge/json_fraction": 0.0,
+            # Backward-compatible aliases.
             "judge/step_json_count": 0,
             "judge/step_json_fraction": 0.0,
             "judge/retry_count": 0,
             "judge/rate_limit_count": 0,
+            "judge/consecutive_rate_limit_steps": 0,
         }
         if timing:
             log_dict.update(timing)
@@ -452,10 +511,20 @@ def _log_metrics(
                 log_dict["judge/total_calls"] = judge_stats.get("total_calls", 0)
                 log_dict["judge/fallback_count"] = judge_stats.get("fallback_count", 0)
                 log_dict["judge/fallback_fraction"] = judge_stats.get("fallback_fraction", 0.0)
-                log_dict["judge/step_json_count"] = judge_stats.get("step_json_count", 0)
-                log_dict["judge/step_json_fraction"] = judge_stats.get("step_json_fraction", 0.0)
+                log_dict["judge/json_count"] = judge_stats.get(
+                    "json_count", judge_stats.get("step_json_count", 0)
+                )
+                log_dict["judge/json_fraction"] = judge_stats.get(
+                    "json_fraction", judge_stats.get("step_json_fraction", 0.0)
+                )
+                # Backward-compatible aliases.
+                log_dict["judge/step_json_count"] = log_dict["judge/json_count"]
+                log_dict["judge/step_json_fraction"] = log_dict["judge/json_fraction"]
                 log_dict["judge/retry_count"] = judge_stats.get("retry_count", 0)
                 log_dict["judge/rate_limit_count"] = judge_stats.get("rate_limit_count", 0)
+                log_dict["judge/consecutive_rate_limit_steps"] = judge_stats.get(
+                    "consecutive_rate_limit_steps", 0
+                )
             except Exception:
                 pass
 
@@ -565,6 +634,22 @@ def _log_metrics(
                 "Consider increasing EXEC_TIMEOUT in config or reducing MAX_TEST_CASES."
             )
 
+        # Observer roll-up metrics: single glance indicators for dashboard monitoring.
+        observer_critical_keys = {
+            "grpo/warn_reward_std_collapse",
+            "grpo/warn_all_zero_collapse",
+            "warn/format_failure",
+            "warn/exec_formatting_breakdown",
+            "warn/exec_zero_sandbox",
+            "warn/reasoning_collapse",
+            "warn/gemini_silent_failure",
+        }
+        critical_fired = [k for k in warnings_fired if k in observer_critical_keys]
+        log_dict["observer/attention_count"] = len(warnings_fired)
+        log_dict["observer/attention_flag"] = 1 if warnings_fired else 0
+        log_dict["observer/critical_count"] = len(critical_fired)
+        log_dict["observer/critical_flag"] = 1 if critical_fired else 0
+
         # Log to wandb: metrics + binary warning flags
         if wandb is not None and wandb.run is not None:
             wandb.log(log_dict)
@@ -583,13 +668,13 @@ def _log_metrics(
             # Send push alert for each fired warning
             for key, msg in warnings_fired.items():
                 try:
-                    wandb.alert(title=key, text=msg, level=wandb.AlertLevel.WARN)
+                    wandb.alert(title=f"OBSERVER/{key}", text=msg, level=wandb.AlertLevel.WARN)
                 except Exception:
                     pass  # alerts are best-effort
 
         # Always print to console regardless of wandb
         for msg in warnings_fired.values():
-            logger.warning(f"WARNING: {msg}")
+            logger.warning(f"OBSERVER_ALERT: {msg}")
 
     except Exception as e:
         logger.warning(f"WandB logging failed: {e}")

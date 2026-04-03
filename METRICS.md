@@ -65,12 +65,19 @@ Quick interpretation:
 - `judge/gemini_mean`: average Gemini judge score for called items.
 - `judge/gemini_calls`: how many completions were sent to Gemini in this batch.
 - `judge/total_calls`: total Gemini requests attempted for this batch.
-- `judge/fallback_count`: how many requests used fallback score (0.5).
+- `judge/fallback_count`: how many requests used fallback path in reward.
 - `judge/fallback_fraction`: fallback_count / total_calls.
-- `judge/step_json_count`: how many judge responses had valid per-step JSON.
-- `judge/step_json_fraction`: step_json_count / total_calls.
+- `judge/json_count`: how many judge responses returned parseable JSON.
+- `judge/json_fraction`: json_count / total_calls.
+- `judge/step_json_count`: backward-compatible alias of `judge/json_count`.
+- `judge/step_json_fraction`: backward-compatible alias of `judge/json_fraction`.
 - `judge/retry_count`: total retry attempts made in this batch.
 - `judge/rate_limit_count`: number of Gemini 429 responses encountered.
+- `judge/consecutive_rate_limit_steps`: running streak of steps with rate limits.
+
+Fallback behavior note:
+- Judge internal fallback value is `0.5`, but training reward uses **presence fallback** on judge failure.
+- So `judge/fallback_fraction` still indicates judge reliability pressure, not a fixed reward value.
 
 ## Generation Quality (`gen/*`, `presence/*`)
 
@@ -89,6 +96,9 @@ Quick interpretation:
 - `data/apps_seen`: cumulative unique APPS problems seen.
 - `data/lcb_seen`: cumulative unique LCB problems seen.
 - `data/easy_seen|medium_seen|hard_seen`: cumulative unique problems seen per difficulty.
+- `data/processed_total`: cumulative number of processed completion rows.
+- `data/apps_processed|lcb_processed`: cumulative processed rows by source.
+- `data/easy_processed|medium_processed|hard_processed`: cumulative processed rows by difficulty.
 
 ## Timing (`timing/*`)
 
@@ -147,3 +157,10 @@ These are binary indicators (`1` fired, `0` clear):
 - `warn/high_timeout_rate`
 
 If one flips to `1`, check console warning text for diagnosis and next action.
+
+## Observer Rollups (`observer/*`)
+
+- `observer/attention_count`: number of warning rules fired in the step.
+- `observer/attention_flag`: `1` if any warning fired, else `0`.
+- `observer/critical_count`: number of critical warning rules fired.
+- `observer/critical_flag`: `1` if any critical warning fired, else `0`.

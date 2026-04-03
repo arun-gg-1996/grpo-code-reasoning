@@ -63,7 +63,7 @@ def test_config_logic():
     print("  normalize_difficulty: OK")
 
     w0 = get_curriculum_weights(0)
-    assert w0["easy"] == 0.9
+    assert w0["easy"] == 0.85
     w800 = get_curriculum_weights(800)
     assert w800["hard"] == 0.2
     print("  get_curriculum_weights: OK")
@@ -86,6 +86,7 @@ def test_extraction():
     assert extract_code("<code>print(1)</code>") == "print(1)"
     assert extract_code("```python\nprint(2)\n```") == "print(2)"
     assert extract_code("<code>```python\nprint(3)\n```</code>") == "print(3)"
+    assert extract_code("```python\nprint(2)\n```", strict_code_tags=True) is None
     assert extract_code("no code here") is None
     print("  extract_code: OK")
 
@@ -132,6 +133,12 @@ def test_judge_parse():
     assert r2 is not None
     print(f"  markdown fence parse: overall={r2['overall']}")
 
+    # JSON overall-only (current prompt contract)
+    r2b = parse_judge_response('{"overall": 0.61}')
+    assert r2b is not None
+    assert abs(r2b["overall"] - 0.61) < 0.01
+    print(f"  overall-only parse: overall={r2b['overall']}")
+
     # Invalid (suppress expected warning noise for this test case)
     import logging
     judge_logger = logging.getLogger("reward.judge")
@@ -144,22 +151,27 @@ def test_judge_parse():
     assert r3 is None
     print("  invalid parse: None (correct)")
 
+    # NaN / inf should be rejected
+    assert parse_judge_response('{"overall": NaN}') is None
+    assert parse_judge_response('{"overall": Infinity}') is None
+    print("  NaN/Inf parse: None (correct)")
+
 
 def test_tier_weights():
-    """Test tier weighting logic."""
-    print("\n--- Testing tier weights ---")
+    """Test reasoning path compatibility helpers."""
+    print("\n--- Testing reasoning helpers ---")
     from reward.reward import _get_tier_weights, _get_source_weights
 
     g, p = _get_tier_weights("easy")
-    assert g == 0.3 and p == 0.7
+    assert g == 1.0 and p == 0.0
     print(f"  easy: gemini={g}, presence={p}")
 
     g, p = _get_tier_weights("medium")
-    assert g == 0.7 and p == 0.3
+    assert g == 1.0 and p == 0.0
     print(f"  medium: gemini={g}, presence={p}")
 
     g, p = _get_tier_weights("hard")
-    assert g == 0.3 and p == 0.7
+    assert g == 1.0 and p == 0.0
     print(f"  hard: gemini={g}, presence={p}")
 
     e, r = _get_source_weights("apps")
@@ -268,6 +280,62 @@ def test_reward_fn_easy():
     print(f"  expected good ~1.0, got {rewards[0]:.3f}")
 
 
+def test_reasoning_fallback_on_judge_failure():
+    """If Gemini fails, reward path must use presence fallback (not fixed 0.5)."""
+    print("\n--- Testing reasoning fallback semantics ---")
+    from reward.reward import reward_fn
+    import reward.judge as judge_mod
+
+    problem = {
+        "difficulty": "easy",
+        "test_cases": [{"input": "", "output": "hello\n"}],
+        "stdin_tests": [{"input": "", "output": "hello\n"}],
+        "is_leetcode": False,
+        "problem_id": "smoke_fallback_1",
+        "question": "Print hello",
+    }
+    completion = (
+        "<think>"
+        "[STEP] Determine this is stdin/stdout output formatting.\n"
+        "[STEP] We only need to print a fixed constant string.\n"
+        "[STEP] No extra data structures are required here.\n"
+        "[STEP] Complexity is O(1) time and O(1) space.\n"
+        "[STEP] Edge cases are minimal for constant output.\n"
+        "[STEP] Implementation is a direct print statement.\n"
+        "</think>\n"
+        "<code>print('world')</code>"
+    )
+
+    orig_score_batch = judge_mod.score_batch
+    orig_get_last_batch_stats = judge_mod.get_last_batch_stats
+    try:
+        judge_mod.score_batch = lambda problems, think_blocks, difficulties: [0.5 for _ in problems]
+        judge_mod.get_last_batch_stats = lambda: {
+            "fallback_mask": [True],
+            "total_calls": 1,
+            "fallback_count": 1,
+            "fallback_fraction": 1.0,
+            "json_count": 0,
+            "json_fraction": 0.0,
+            "retry_count": 0,
+            "rate_limit_count": 0,
+        }
+        rewards = reward_fn(
+            completions=[completion],
+            prompts=["p"],
+            problems=[problem],
+            source=["apps"],
+        )
+    finally:
+        judge_mod.score_batch = orig_score_batch
+        judge_mod.get_last_batch_stats = orig_get_last_batch_stats
+
+    # With exec=0 and strong presence score, fallback reward should be > 0.2.
+    # If judge 0.5 was incorrectly used as real score, this would be ~0.125.
+    print(f"  fallback reward: {rewards[0]:.3f}")
+    assert rewards[0] > 0.2, "Expected presence fallback score on judge failure"
+
+
 def _normalize_test_cases(problem):
     """Same normalization as train.py — duplicated here to avoid heavy imports."""
     if problem.get("test_cases"):
@@ -365,6 +433,7 @@ if __name__ == "__main__":
         test_tier_weights()
         test_execution_sandbox()
         test_reward_fn_easy()
+        test_reasoning_fallback_on_judge_failure()
         test_data_loading()
         test_prompt_format_hints()
 

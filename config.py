@@ -12,6 +12,7 @@ Everything else imports from this file — never hardcode values elsewhere.
 
 TRAINING_MODEL = "Qwen/Qwen2.5-Coder-7B-Instruct"
 LOCAL_TRAINING_MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct"  # for local smoke test
+ATTN_IMPLEMENTATION = "flash_attention_2"  # use Flash Attention 2 when running on GPU
 
 # Judge — Gemini via API key auth (aiplatform.googleapis.com)
 JUDGE_MODEL = "gemini-2.5-flash-lite"
@@ -29,7 +30,7 @@ GEMINI_API_KEY = os.environ.get("gemini_api_key", os.environ.get("api_key", ""))
 
 G = 8  # rollouts per problem (GROUP_SIZE alias below)
 GROUP_SIZE = G  # alias — used throughout reward.py and logging
-BATCH_SIZE = 2  # problems per training step → 2 * 8 = 16 completions per step
+BATCH_SIZE = 4  # problems per training step → 4 * 8 = 32 completions per step
 ROLLOUT_TEMPERATURE = 0.7
 EVAL_TEMPERATURE = 0.2
 MAX_NEW_TOKENS = 2048
@@ -44,15 +45,26 @@ LEARNING_RATE = 1e-6  # standard for GRPO on 7B (DeepSeek-R1 range: 1e-6 to 3e-6
 KL_COEFF = 0.04  # KL penalty — controls drift from reference model
 WARMUP_STEPS = 50  # short warmup, standard for RL fine-tuning
 MAX_TRAINING_STEPS = 2000  # ~enough for 4 curriculum phases + convergence
-GRADIENT_ACCUMULATION_STEPS = 4
-VLLM_GPU_MEMORY_UTILIZATION = 0.30  # leaves headroom for GRPO training tensors
+GRADIENT_ACCUMULATION_STEPS = 8  # smoother effective updates without increasing VRAM much
+VLLM_GPU_MEMORY_UTILIZATION = 0.25  # keep vLLM share stable with recent training runs
+VLLM_MODE = "colocate"  # explicitly run colocated vLLM with trainer on single-GPU setup
+TRAIN_SEED = 42  # deterministic curriculum pre-build sampling
+
+# Generation/memory knobs for colocated vLLM.
+# Keep per-step generations in smaller chunks to reduce peak memory.
+GENERATION_BATCH_SIZE = 16
+# vLLM KV cache cap: prompt + completion budget used by this project.
+VLLM_MAX_MODEL_LENGTH = MAX_PROMPT_LENGTH + MAX_NEW_TOKENS
+# In colocate mode, offload vLLM state during optimizer step to free VRAM headroom.
+VLLM_ENABLE_SLEEP_MODE = True
+STRICT_TRAIN_CODE_TAGS = True  # require <code>...</code> contract during training reward extraction
 
 # ─────────────────────────────────────────
 # LoRA config
 # ─────────────────────────────────────────
 
-LORA_RANK = 8
-LORA_ALPHA = 16  # 2x rank — standard
+LORA_RANK = 16
+LORA_ALPHA = 32  # keep alpha at 2x rank
 LORA_DROPOUT = 0.05
 LORA_TARGET_MODULES = [
     "q_proj", "v_proj", "k_proj", "o_proj",  # attention layers
@@ -70,14 +82,13 @@ APPS_REASONING_WEIGHT = 0.25
 LCB_EXEC_WEIGHT = 0.60
 LCB_REASONING_WEIGHT = 0.40
 
-# Tier-weighted reasoning: Gemini vs presence per difficulty
-# Easy: include Gemini so easy-tier reasoning is not scored by presence alone.
+# Legacy tier-weight constants (kept for compatibility/tests).
+# Current reward policy is Gemini-first for all tiers with presence fallback on judge failure.
+# Easy/medium/hard weights below are not used in the active reasoning score path.
 EASY_GEMINI_WEIGHT = 0.3
 EASY_PRESENCE_WEIGHT = 0.7
-# Medium: 70% Gemini (std=0.16, confirmed reliable)
 MEDIUM_GEMINI_WEIGHT = 0.7
 MEDIUM_PRESENCE_WEIGHT = 0.3
-# Hard: 30% Gemini (std=0.187 but false negative risk)
 HARD_GEMINI_WEIGHT = 0.3
 HARD_PRESENCE_WEIGHT = 0.7
 
@@ -89,7 +100,7 @@ REWARD_STD_WARNING_THRESHOLD = 0.05  # reward_std below this → diversity colla
 
 # Max concurrent Gemini calls in one reward batch.
 # Keep modest to reduce 429 rate-limit bursts.
-GEMINI_MAX_WORKERS = 4
+GEMINI_MAX_WORKERS = 2
 # Timeout per call (seconds).
 GEMINI_TIMEOUT = 30
 # Judge response is short; cap output tokens.
@@ -105,6 +116,8 @@ GEMINI_RETRY_MAX_DELAY_S = 30.0
 
 SANDBOX_MAX_WORKERS = 16  # persistent pool size for parallel sandbox execution
 SANDBOX_TIMEOUT = 5  # seconds per subprocess execution before SIGKILL
+SANDBOX_PER_TEST_TIMEOUT_S = 4  # per-test timeout inside checker
+SANDBOX_MAX_MEMORY_MB = 2048  # per-subprocess memory cap via RLIMIT
 MAX_TEST_CASES = 10  # test cases per problem during training (cap for speed)
 
 # Aliases used by reward/execution.py (DO NOT REMOVE)
@@ -137,19 +150,19 @@ EVAL_K_VALUES = [1, 3]  # pass@1 is primary metric, pass@3 for completeness
 CURRICULUM = [
     # Phase 0: easy only — model learns format, [STEP] blocks, basic reward signal
     (0, {
-        "difficulty": {"easy": 0.9, "medium": 0.1, "hard": 0.0}
+        "difficulty": {"easy": 0.85, "medium": 0.15, "hard": 0.0}
     }),
-    # Phase 1: introduce medium — easy anchors reward signal while medium challenges
-    (300, {
-        "difficulty": {"easy": 0.7, "medium": 0.3, "hard": 0.0}
+    # Phase 1: introduce medium earlier
+    (200, {
+        "difficulty": {"easy": 0.60, "medium": 0.40, "hard": 0.0}
     }),
-    # Phase 2: introduce hard gradually
-    (800, {
-        "difficulty": {"easy": 0.3, "medium": 0.5, "hard": 0.2}
+    # Phase 2: stronger medium/hard exposure
+    (600, {
+        "difficulty": {"easy": 0.35, "medium": 0.45, "hard": 0.20}
     }),
-    # Phase 3: full distribution — bias toward harder problems
-    (1500, {
-        "difficulty": {"easy": 0.2, "medium": 0.4, "hard": 0.4}
+    # Phase 3: hard-biased late curriculum
+    (1200, {
+        "difficulty": {"easy": 0.20, "medium": 0.35, "hard": 0.45}
     }),
 ]
 
@@ -201,18 +214,28 @@ FAILED_DIR = "data/failed"
 TRAINING_SYSTEM_PROMPT = """You are an expert competitive programmer.
 Solve the following problem step by step.
 
-First, think through your approach inside <think> tags using exactly these steps:
-[STEP] Problem understanding: what is being asked, input/output format, constraints
-[STEP] Algorithm choice: what algorithm/approach and why
-[STEP] Data structures: what data structures are needed and why
-[STEP] Time and space complexity: expected complexity
-[STEP] Edge cases: what edge cases need to be handled
-[STEP] Implementation plan: how to translate the approach to code
+Output contract (strict):
+1) Output exactly one <think>...</think> block, then exactly one <code>...</code> block.
+2) Do not output any text before <think> or after </code>.
+3) Inside <code>, output raw Python only (no markdown fences like ```).
+4) Never leave <code> empty.
 
-Then write your complete Python solution inside <code> tags.
-Follow the output format requirements in the user prompt exactly.
+Inside <think>, use [STEP] blocks.
+Use as many [STEP] blocks as needed to reach a correct, implementable solution.
+Keep each [STEP] concise and information-dense (avoid filler or repetition).
+The first [STEP] must start by deciding the execution format:
+- function-style vs stdin/stdout
+- required function name/signature (if function-style)
+- input/output format and constraints
 
-Use as many [STEP] blocks as you need — there is no limit."""
+Then continue with:
+[STEP] Algorithm choice
+[STEP] Data structures
+[STEP] Time and space complexity
+[STEP] Edge cases
+[STEP] Implementation plan
+
+Follow the output format requirements in the user prompt exactly."""
 
 EVAL_SYSTEM_PROMPT_STDIO = """You are an expert competitive programmer.
 Solve the following problem. Write your complete Python solution.
@@ -229,15 +252,24 @@ Complete the following function."""
 
 JUDGE_SYSTEM_PROMPT = """You are an expert evaluator of competitive programming reasoning.
 You will be given a coding problem and a model's step-by-step reasoning trace.
-Score the reasoning quality from 0.0 to 1.0.
+Score reasoning quality from 0.0 to 1.0.
 
 Evaluate based on:
 - Are the reasoning steps logically correct?
 - Does the reasoning lead toward a valid solution approach?
 - Are there factually incorrect statements about algorithms, data structures, or Python?
 - Is the reasoning coherent and progressive (not circular or confused)?
+- Does it cover the critical decisions needed to implement a correct solution?
+- Is it concise and non-repetitive? (do not reward verbosity)
 
-Respond with ONLY a float between 0.0 and 1.0. Nothing else. No explanation."""
+Penalize explicitly:
+- repeated restatement of the same idea across steps
+- filler text with no new technical content
+- long reasoning that does not improve correctness
+
+Respond with ONLY JSON in this exact format:
+{"overall": 0.0}
+No markdown, no prose, no extra keys."""
 
 # ─────────────────────────────────────────
 # Aliases (must be at end of file — after definitions they reference)

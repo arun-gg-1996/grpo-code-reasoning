@@ -53,13 +53,15 @@ Read:
 
 Pin:
 - `judge/fallback_fraction`
-- `judge/step_json_fraction`
+- `judge/json_fraction`
 - `judge/retry_count`
 - `judge/rate_limit_count`
+- `judge/consecutive_rate_limit_steps`
 - `timing/reward_judge_s`
 
 Read:
 - rising `rate_limit_count` + `retry_count` indicates quota/concurrency pressure.
+- non-zero `consecutive_rate_limit_steps` means sustained judge pressure (not one-off spikes).
 - high `fallback_fraction` indicates degraded judge signal quality.
 
 ## Section 5: Throughput and System
@@ -102,6 +104,10 @@ Pin all warning flags:
 - `warn/problems_too_easy`
 - `warn/empty_completions`
 - `warn/high_timeout_rate`
+- `observer/attention_flag`
+- `observer/critical_flag`
+- `observer/attention_count`
+- `observer/critical_count`
 
 Read:
 - investigate immediately when any warning flag stays at `1` for multiple steps.
