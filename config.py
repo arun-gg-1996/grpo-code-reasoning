@@ -12,7 +12,7 @@ Everything else imports from this file — never hardcode values elsewhere.
 
 TRAINING_MODEL = "Qwen/Qwen2.5-Coder-7B-Instruct"
 LOCAL_TRAINING_MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct"  # for local smoke test
-ATTN_IMPLEMENTATION = "flash_attention_2"  # use Flash Attention 2 when running on GPU
+ATTN_IMPLEMENTATION = "sdpa"  # non-Flash attention backend for stable training without flash-attn build
 
 # Judge — Gemini via API key auth (aiplatform.googleapis.com)
 JUDGE_MODEL = "gemini-2.5-flash-lite"

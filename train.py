@@ -642,9 +642,18 @@ def main():
             {"torch_dtype": "float32", "device_map": "cpu"}
             if (args.smoke_test and (not smoke_use_gpu))
             else (
-                {"attn_implementation": ATTN_IMPLEMENTATION, "torch_dtype": torch.bfloat16}
-                if not args.smoke_test
-                else None
+                (
+                    {
+                        "torch_dtype": torch.bfloat16,
+                        **(
+                            {"attn_implementation": ATTN_IMPLEMENTATION}
+                            if ATTN_IMPLEMENTATION
+                            else {}
+                        ),
+                    }
+                    if not args.smoke_test
+                    else None
+                )
             )
         ),
         use_vllm=(not args.smoke_test) or (args.smoke_test and smoke_use_vllm),
