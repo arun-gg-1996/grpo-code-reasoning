@@ -23,6 +23,29 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+APT_UPDATED=0
+apt_update_once() {
+  if [[ "$APT_UPDATED" -eq 1 ]]; then
+    return 0
+  fi
+  if need_cmd sudo; then
+    sudo apt-get update
+  else
+    apt-get update
+  fi
+  APT_UPDATED=1
+}
+
+apt_install_pkg() {
+  local pkg="$1"
+  apt_update_once
+  if need_cmd sudo; then
+    sudo apt-get install -y "$pkg"
+  else
+    apt-get install -y "$pkg"
+  fi
+}
+
 ensure_system_deps() {
   local missing=()
   need_cmd git || missing+=("git")
@@ -35,11 +58,10 @@ ensure_system_deps() {
 
   if [[ ${#missing[@]} -gt 0 ]]; then
     echo "Installing system packages: ${missing[*]}"
+    apt_update_once
     if need_cmd sudo; then
-      sudo apt-get update
       sudo apt-get install -y "${missing[@]}"
     else
-      apt-get update
       apt-get install -y "${missing[@]}"
     fi
   fi
@@ -68,6 +90,68 @@ if (major, minor) < (3, 10):
     raise SystemExit("ERROR: Python 3.10+ is required.")
 print(f"Using Python {major}.{minor}")
 PY
+}
+
+python_xy_version() {
+  local py="$1"
+  "$py" - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+}
+
+ensure_python_venv_support() {
+  local py="$1"
+  local pyver
+  pyver="$(python_xy_version "$py")"
+  local candidates=("python${pyver}-venv" "python3-venv")
+
+  echo "Installing missing venv support for Python ${pyver}..."
+  local installed=0
+  for pkg in "${candidates[@]}"; do
+    if apt_install_pkg "$pkg"; then
+      echo "Installed: $pkg"
+      installed=1
+      break
+    fi
+    echo "Package unavailable or failed: $pkg"
+  done
+
+  if [[ "$installed" -ne 1 ]]; then
+    echo "ERROR: Unable to install Python venv support automatically."
+    echo "Tried: ${candidates[*]}"
+    echo "Please install manually, then rerun:"
+    echo "  sudo apt-get install -y python${pyver}-venv"
+    echo "or"
+    echo "  sudo apt-get install -y python3-venv"
+    exit 1
+  fi
+}
+
+create_venv_with_repair() {
+  local py="$1"
+  local venv_dir="$2"
+  local err_log
+  err_log="$(mktemp)"
+
+  if "$py" -m venv "$venv_dir" 2>"$err_log"; then
+    rm -f "$err_log"
+    return 0
+  fi
+
+  if grep -qiE "ensurepip is not available|No module named ensurepip" "$err_log"; then
+    cat "$err_log"
+    ensure_python_venv_support "$py"
+    rm -rf "$venv_dir"
+    "$py" -m venv "$venv_dir"
+    rm -f "$err_log"
+    return 0
+  fi
+
+  echo "ERROR: Failed to create virtualenv."
+  cat "$err_log"
+  rm -f "$err_log"
+  exit 1
 }
 
 echo "=== GRPO Server Setup ==="
@@ -102,7 +186,7 @@ fi
 cd "$PROJECT_DIR"
 
 echo "Creating virtualenv at $VENV_DIR..."
-$PYTHON_BIN -m venv "$VENV_DIR"
+create_venv_with_repair "$PYTHON_BIN" "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
 
 echo "Installing Python deps..."
