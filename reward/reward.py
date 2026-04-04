@@ -72,6 +72,34 @@ def _extract_think_block(completion: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+def _unwrap_completion(completion) -> str:
+    """
+    Normalize TRL completion payloads into plain assistant text.
+
+    TRL may pass completions as:
+      - plain string
+      - list[{"role": "...", "content": "..."}] chat messages
+      - {"role": "...", "content": "..."} dict
+
+    Using str(payload) on list/dict chat outputs produces repr()-escaped text
+    (e.g., "\\n"), which corrupts extraction/execution. We must unwrap content.
+    """
+    if isinstance(completion, str):
+        return completion
+
+    if isinstance(completion, list):
+        for message in reversed(completion):
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                content = message.get("content", "")
+                return content if isinstance(content, str) else str(content)
+
+    if isinstance(completion, dict) and completion.get("role") == "assistant":
+        content = completion.get("content", "")
+        return content if isinstance(content, str) else str(content)
+
+    return str(completion)
+
+
 def _presence_score(think_block: str) -> float:
     """
     Simple fallback score from <think> when Gemini fails.
@@ -184,7 +212,7 @@ def reward_fn(
             n, GROUP_SIZE
         )
 
-    completions = [c if isinstance(c, str) else str(c) for c in completions]
+    completions = [_unwrap_completion(c) for c in completions]
 
     # Normalize difficulties
     difficulties = [

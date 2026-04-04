@@ -121,6 +121,30 @@ def test_extraction():
     print(f"  presence_score (2 short steps): {score2}")
 
 
+def test_completion_unwrap():
+    """Ensure chat-structured completions are unwrapped to plain assistant text."""
+    print("\n--- Testing completion unwrap ---")
+    from reward.reward import _unwrap_completion
+
+    text = "<think>reason</think>\n```python\nprint('ok')\n```"
+
+    # Plain text passthrough
+    assert _unwrap_completion(text) == text
+
+    # TRL message-list completion
+    list_payload = [{"role": "assistant", "content": text}]
+    out_list = _unwrap_completion(list_payload)
+    assert out_list == text
+    assert "\n" in out_list and "\\n" not in out_list
+
+    # Dict completion
+    dict_payload = {"role": "assistant", "content": text}
+    out_dict = _unwrap_completion(dict_payload)
+    assert out_dict == text
+
+    print("  completion unwrap: OK")
+
+
 def test_judge_parse():
     """Test Gemini judge response parsing."""
     print("\n--- Testing judge parse ---")
@@ -444,6 +468,7 @@ if __name__ == "__main__":
         test_imports()
         test_config_logic()
         test_extraction()
+        test_completion_unwrap()
         test_judge_parse()
         test_tier_weights()
         test_execution_sandbox()
