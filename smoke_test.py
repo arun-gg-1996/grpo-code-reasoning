@@ -83,11 +83,16 @@ def test_extraction():
     from reward.reward import _extract_think_block, _presence_score
 
     # Code extraction
-    assert extract_code("<code>print(1)</code>") == "print(1)"
-    assert extract_code("```python\nprint(2)\n```") == "print(2)"
-    assert extract_code("<code>```python\nprint(3)\n```</code>") == "print(3)"
-    assert extract_code("```python\nprint(2)\n```", strict_code_tags=True) is None
-    assert extract_code("no code here") is None
+    code, mode = extract_code("<code>print(1)</code>")
+    assert code == "print(1)" and mode == "fence"
+    code, mode = extract_code("```python\nprint(2)\n```")
+    assert code == "print(2)" and mode == "strict"
+    code, mode = extract_code("```\nprint(4)\n```")
+    assert code == "print(4)" and mode == "fence"
+    code, mode = extract_code("<code>```python\nprint(3)\n```</code>")
+    assert code == "print(3)" and mode == "strict"
+    code, mode = extract_code("no code here")
+    assert code is None and mode == "none"
     print("  extract_code: OK")
 
     # Think block extraction
@@ -243,18 +248,17 @@ def test_reward_fn_easy():
     # Good completion: correct code + valid reasoning
     good = (
         "<think>"
-        "[STEP] The problem asks us to print hello to stdout\n"
-        "[STEP] Simple output problem, just use print statement\n"
-        "[STEP] No data structures needed for this problem\n"
-        "[STEP] O(1) time and space, constant operation\n"
-        "[STEP] No edge cases for simple print output\n"
-        "[STEP] Just call print with the string hello\n"
+        "The problem asks us to print hello to stdout.\n"
+        "Simple output problem, just use print statement.\n"
+        "No data structures are needed.\n"
+        "Complexity is O(1) time and O(1) space.\n"
+        "Implementation is a single print call.\n"
         "</think>\n"
-        '<code>print("hello")</code>'
+        '```python\nprint("hello")\n```'
     )
 
     # Bad completion: wrong code, no reasoning
-    bad = '<code>print("world")</code>'
+    bad = '```python\nprint("world")\n```'
 
     # No code at all
     empty = "I don't know how to solve this"
@@ -296,14 +300,13 @@ def test_reasoning_fallback_on_judge_failure():
     }
     completion = (
         "<think>"
-        "[STEP] Determine this is stdin/stdout output formatting.\n"
-        "[STEP] We only need to print a fixed constant string.\n"
-        "[STEP] No extra data structures are required here.\n"
-        "[STEP] Complexity is O(1) time and O(1) space.\n"
-        "[STEP] Edge cases are minimal for constant output.\n"
-        "[STEP] Implementation is a direct print statement.\n"
+        "Determine this is stdin/stdout output formatting.\n"
+        "We only need to print a fixed constant string.\n"
+        "No extra data structures are required.\n"
+        "Complexity is O(1) time and O(1) space.\n"
+        "Implementation is a direct print statement.\n"
         "</think>\n"
-        "<code>print('world')</code>"
+        "```python\nprint('world')\n```"
     )
 
     orig_score_batch = judge_mod.score_batch
@@ -397,9 +400,12 @@ def test_prompt_format_hints():
     """Verify format-routing logic and global prompt guidance."""
     print("\n--- Testing prompt format hints ---")
     from config import TRAINING_SYSTEM_PROMPT
+    from train import build_prompt
     from problem_format import is_function_style_problem, get_function_name
 
-    assert "Follow the output format requirements in the user prompt exactly." in TRAINING_SYSTEM_PROMPT
+    assert "<think>...</think>" in TRAINING_SYSTEM_PROMPT
+    assert "```python code block" in TRAINING_SYSTEM_PROMPT
+    assert "<code>" not in TRAINING_SYSTEM_PROMPT
 
     stdio_problem = {
         "question": "Read n and print n",
@@ -408,6 +414,11 @@ def test_prompt_format_hints():
         "func_name": None,
     }
     assert is_function_style_problem(stdio_problem) is False
+    stdio_prompt = build_prompt(stdio_problem)
+    assert isinstance(stdio_prompt, list) and len(stdio_prompt) == 2
+    assert stdio_prompt[0]["role"] == "system"
+    assert stdio_prompt[1]["role"] == "user"
+    assert "stdin/stdout problem" in stdio_prompt[1]["content"]
 
     func_problem = {
         "question": "Implement function foo",
@@ -417,6 +428,10 @@ def test_prompt_format_hints():
     }
     assert is_function_style_problem(func_problem) is True
     assert get_function_name(func_problem) == "foo"
+    func_prompt = build_prompt(func_problem)
+    assert isinstance(func_prompt, list) and len(func_prompt) == 2
+    assert "function-style problem" in func_prompt[1]["content"]
+    assert "Implement the expected function `foo` exactly as specified." in func_prompt[1]["content"]
     print("  prompt format routing: OK")
 
 

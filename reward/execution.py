@@ -373,11 +373,15 @@ def score_batch(
 # Code extraction
 # ─────────────────────────────────────────
 
-def extract_code(response: str, strict_code_tags: bool = False) -> Optional[str]:
+def extract_code(response: str) -> tuple[Optional[str], str]:
     """
-    Extract code from model response.
-    Expects <code>...</code> tags.
-    Returns None if no code block found.
+    Extract code from model response using a three-stage ladder.
+
+    Returns:
+        (code, mode) where mode is one of:
+          - "strict": extracted from preferred ```python fenced block
+          - "fence": extracted from secondary code block forms
+          - "none": no extractable code found
     """
     import re
     def _strip_markdown_fences(code_text: str) -> str:
@@ -411,17 +415,24 @@ def extract_code(response: str, strict_code_tags: bool = False) -> Optional[str]
                 lines = lines[:-1]
         return "\n".join(lines).strip()
 
-    match = re.search(r"<code>(.*?)</code>", response, re.DOTALL)
+    # Stage 1 (preferred): ```python fenced block
+    match = re.search(r"```python\s*(.*?)```", response, re.DOTALL | re.IGNORECASE)
     if match:
-        return _strip_markdown_fences(match.group(1))
-    if strict_code_tags:
-        return None
-    # fallback: ```python blocks
-    match = re.search(r"```python\s*(.*?)```", response, re.DOTALL)
-    if match:
-        return _strip_markdown_fences(match.group(1))
-    # fallback: any ``` block
+        code = match.group(1).strip()
+        if code:
+            return code, "strict"
+
+    # Stage 2: any fenced code block
     match = re.search(r"```\s*(.*?)```", response, re.DOTALL)
     if match:
-        return _strip_markdown_fences(match.group(1))
-    return None
+        code = match.group(1).strip()
+        if code:
+            return code, "fence"
+
+    # Stage 3: legacy <code>...</code> block
+    match = re.search(r"<code>(.*?)</code>", response, re.DOTALL | re.IGNORECASE)
+    if match:
+        code = _strip_markdown_fences(match.group(1))
+        if code:
+            return code, "fence"
+    return None, "none"

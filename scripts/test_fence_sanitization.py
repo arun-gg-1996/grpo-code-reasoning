@@ -40,7 +40,7 @@ def main() -> int:
     bad = []
     for r in fenced:
         completion = r.get("completion_text") or ""
-        code = extract_code(completion)
+        code, _extract_mode = extract_code(completion)
         if code is None:
             continue
         checked += 1

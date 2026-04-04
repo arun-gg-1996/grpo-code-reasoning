@@ -38,7 +38,8 @@ from config import (
     # Misc
     GROUP_SIZE,
     MAX_NEW_TOKENS,
-    STRICT_TRAIN_CODE_TAGS,
+    FORMAT_PENALTY_STRICT,
+    FORMAT_PENALTY_FENCE,
     normalize_difficulty,
 )
 from reward.execution import score_batch as exec_score_batch, extract_code, score_single
@@ -83,6 +84,13 @@ def _presence_score(think_block: str) -> float:
 
     parts = re.split(r"\[STEP\]", think_block, flags=re.IGNORECASE)
     raw_steps = [s.strip() for s in (parts[1:] if len(parts) > 1 else []) if s.strip()]
+    # If the model does not use [STEP] markers, fall back to line/sentence chunks.
+    if not raw_steps:
+        raw_steps = [
+            s.strip()
+            for s in re.split(r"\n+|(?<=[.!?])\s+", think_block)
+            if s and s.strip()
+        ]
     if not raw_steps:
         return 0.0
 
@@ -204,7 +212,15 @@ def reward_fn(
     # ------------------------------------------------------------------
     # Step 1: Extract code and think blocks
     # ------------------------------------------------------------------
-    codes = [extract_code(c, strict_code_tags=STRICT_TRAIN_CODE_TAGS) or "" for c in completions]
+    extraction_results = [extract_code(c) for c in completions]
+    codes = [code or "" for code, _mode in extraction_results]
+    extract_modes = [mode for _code, mode in extraction_results]
+    format_multipliers = [
+        FORMAT_PENALTY_STRICT if mode == "strict"
+        else FORMAT_PENALTY_FENCE if mode == "fence"
+        else 0.0
+        for mode in extract_modes
+    ]
     think_blocks = [_extract_think_block(c) for c in completions]
 
     # ------------------------------------------------------------------
@@ -275,6 +291,7 @@ def reward_fn(
     # ------------------------------------------------------------------
     final_rewards = []
     reasoning_scores = []
+    penalized_exec_scores = []
 
     for i in range(n):
         source = sources[i]
@@ -291,7 +308,9 @@ def reward_fn(
 
         # Per-source weighting
         exec_w, reas_w = _get_source_weights(source)
-        reward = exec_w * exec_scores[i] + reas_w * reasoning_score
+        penalized_exec = exec_scores[i] * format_multipliers[i]
+        penalized_exec_scores.append(penalized_exec)
+        reward = exec_w * penalized_exec + reas_w * reasoning_score
         final_rewards.append(reward)
 
     # ------------------------------------------------------------------
@@ -308,12 +327,15 @@ def reward_fn(
         problems=problems,
         prompts=prompts,
         codes=codes,
+        extract_modes=extract_modes,
+        penalized_exec_scores=penalized_exec_scores,
         completions=completions,
     )
 
     _log_metrics(
         final_rewards, exec_scores, presence_scores, gemini_scores,
-        reasoning_scores, difficulties, sources, think_blocks, codes, completions, exec_stats,
+        reasoning_scores, penalized_exec_scores, extract_modes,
+        difficulties, sources, think_blocks, codes, completions, exec_stats,
         timing={
             "timing/reward_total_s": time.perf_counter() - t_reward_start,
             "timing/reward_execution_s": exec_time_s,
@@ -349,11 +371,13 @@ def _log_train_debug_rows(
     presence_scores: list[float],
     gemini_scores: list[float | None],
     reasoning_scores: list[float],
+    penalized_exec_scores: list[float],
     difficulties: list[str],
     sources: list[str],
     problems: list[dict],
     prompts: list[str],
     codes: list[str],
+    extract_modes: list[str],
     completions: list[str],
 ) -> None:
     """Append one JSONL row per completion for post-hoc debugging."""
@@ -386,10 +410,14 @@ def _log_train_debug_rows(
                     else float(gemini_scores[i])
                 ),
                 "reasoning_score": float(reasoning_scores[i]) if i < len(reasoning_scores) else 0.0,
+                "penalized_execution_score": (
+                    float(penalized_exec_scores[i]) if i < len(penalized_exec_scores) else 0.0
+                ),
                 "final_reward": float(rewards[i]) if i < len(rewards) else 0.0,
                 "prompt": prompts[i] if i < len(prompts) else "",
                 "problem_statement": p.get("question", ""),
                 "extracted_code": codes[i] if i < len(codes) else "",
+                "extract_mode": extract_modes[i] if i < len(extract_modes) else "none",
                 "completion_text": completions[i],
                 "has_code_block": bool(codes[i].strip()) if i < len(codes) else False,
             }
@@ -401,7 +429,8 @@ def _log_train_debug_rows(
 
 def _log_metrics(
     rewards, exec_scores, presence_scores, gemini_scores,
-    reasoning_scores, difficulties, sources, think_blocks, codes, completions, exec_stats,
+    reasoning_scores, penalized_exec_scores, extract_modes,
+    difficulties, sources, think_blocks, codes, completions, exec_stats,
     timing=None,
 ):
     """Log comprehensive metrics to WandB and emit console warnings on threshold breaches."""
@@ -411,6 +440,7 @@ def _log_metrics(
         exec_arr = np.array(exec_scores)
         presence_arr = np.array(presence_scores)
         reasoning_arr = np.array(reasoning_scores)
+        penalized_exec_arr = np.array(penalized_exec_scores)
         diff_arr = np.array(difficulties)
 
         log_dict = {
@@ -419,6 +449,7 @@ def _log_metrics(
             "reward/std": reward_arr.std(),
             "reward/non_zero_fraction": (reward_arr > 0).mean(),
             "reward/execution_mean": exec_arr.mean(),
+            "exec/penalized_execution_mean": penalized_exec_arr.mean(),
             "reward/reasoning_mean": reasoning_arr.mean(),
             # Execution stats
             "exec/mean_score": exec_stats.get("mean_score", 0),
@@ -436,6 +467,9 @@ def _log_metrics(
             "gen/valid_code_fraction": sum(1 for c in codes if c) / n,
             "gen/has_reasoning_fraction": sum(1 for t in think_blocks if t) / n,
             "gen/empty_completion_fraction": sum(1 for c in completions if not c.strip()) / n,
+            "exec/extract_strict_fraction": sum(1 for m in extract_modes if m == "strict") / n,
+            "exec/extract_fence_fraction": sum(1 for m in extract_modes if m == "fence") / n,
+            "exec/extract_none_fraction": sum(1 for m in extract_modes if m == "none") / n,
             # Completion length (chars; ~4 chars per token as rough proxy)
             # Watch these over training: think_chars should grow (more reasoning),
             # truncated_fraction should stay near 0 (if high, increase MAX_NEW_TOKENS)
@@ -553,6 +587,13 @@ def _log_metrics(
             log_dict["grpo/all_zero_fraction"] = (groups == 0.0).all(axis=1).mean()
             log_dict["grpo/all_perfect_fraction"] = (groups >= 0.99).all(axis=1).mean()
 
+            exec_groups = exec_arr.reshape(n_problems, GROUP_SIZE)
+            # pass@G proxy in training loop:
+            # - pass_at_G: any rollout gets non-zero execution score
+            # - perfect_at_G: any rollout gets full execution score
+            log_dict["grpo/pass_at_G_fraction"] = (exec_groups.max(axis=1) > 0.0).mean()
+            log_dict["grpo/perfect_at_G_fraction"] = (exec_groups.max(axis=1) >= 1.0).mean()
+
         # ── Early warning system ──────────────────────────────────────────
         # Evaluate all thresholds, collect fired warnings, then log to wandb
         warnings_fired = {}  # key → message
@@ -568,7 +609,7 @@ def _log_metrics(
         if non_zero_frac < 0.2:
             warnings_fired["warn/format_failure"] = (
                 f"Format failure — only {non_zero_frac:.1%} of completions have non-zero reward. "
-                "Model may not be following output format (missing <code> tags)."
+                "Model may not be following output format (missing/invalid code blocks)."
             )
 
         all_zero_frac = log_dict.get("grpo/all_zero_fraction")
@@ -584,7 +625,7 @@ def _log_metrics(
                 warnings_fired["warn/exec_formatting_breakdown"] = (
                     f"Formatting breakdown — {exec_zero_frac:.1%} execution zero, "
                     f"only {valid_code_frac:.1%} completions have valid code blocks. "
-                    "Model has stopped producing <code> tags."
+                    "Model has stopped producing parseable code blocks."
                 )
             else:
                 warnings_fired["warn/exec_zero_sandbox"] = (

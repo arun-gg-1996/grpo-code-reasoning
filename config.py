@@ -57,7 +57,12 @@ GENERATION_BATCH_SIZE = 16
 VLLM_MAX_MODEL_LENGTH = MAX_PROMPT_LENGTH + MAX_NEW_TOKENS
 # In colocate mode, offload vLLM state during optimizer step to free VRAM headroom.
 VLLM_ENABLE_SLEEP_MODE = True
-STRICT_TRAIN_CODE_TAGS = True  # require <code>...</code> contract during training reward extraction
+
+# Format multipliers for training-time code extraction.
+# strict: extracted from preferred ```python blocks
+# fence:  extracted from legacy/secondary code block forms
+FORMAT_PENALTY_STRICT = 1.00
+FORMAT_PENALTY_FENCE = 1.00
 
 # ─────────────────────────────────────────
 # LoRA config
@@ -206,36 +211,25 @@ FAILED_DIR = "data/failed"
 
 # ─────────────────────────────────────────
 # Training prompt template
-# Model is instructed to reason inside <think> tags using [STEP] blocks,
-# then write solution inside <code> tags.
-# Both tags are parsed in reward.py for scoring.
+# Model is instructed to reason inside <think> tags,
+# then write code inside a ```python fenced block.
+# Code is extracted in reward/execution.py.
 # ─────────────────────────────────────────
 
 TRAINING_SYSTEM_PROMPT = """You are an expert competitive programmer.
 Solve the following problem step by step.
 
-Output contract (strict):
-1) Output exactly one <think>...</think> block, then exactly one <code>...</code> block.
-2) Do not output any text before <think> or after </code>.
-3) Inside <code>, output raw Python only (no markdown fences like ```).
-4) Never leave <code> empty.
+Output format:
+1) Think through your solution inside <think>...</think> tags. Reason step by step (algorithm choice, data structures, edge cases, implementation plan). Be concise and avoid repetition.
+2) Then write your complete Python solution in a ```python code block.
+3) Do not output any text before <think> or after the closing code fence.
+4) Never leave the code block empty.
 
-Inside <think>, use [STEP] blocks.
-Use as many [STEP] blocks as needed to reach a correct, implementable solution.
-Keep each [STEP] concise and information-dense (avoid filler or repetition).
-The first [STEP] must start by deciding the execution format:
+In your reasoning, first decide the execution format for this problem:
 - function-style vs stdin/stdout
 - required function name/signature (if function-style)
-- input/output format and constraints
-
-Then continue with:
-[STEP] Algorithm choice
-[STEP] Data structures
-[STEP] Time and space complexity
-[STEP] Edge cases
-[STEP] Implementation plan
-
-Follow the output format requirements in the user prompt exactly."""
+- input/output format and constraints.
+"""
 
 EVAL_SYSTEM_PROMPT_STDIO = """You are an expert competitive programmer.
 Solve the following problem. Write your complete Python solution.
@@ -247,7 +241,7 @@ Complete the following function."""
 # ─────────────────────────────────────────
 # Gemini judge prompt
 # Sent to gemini-2.5-flash with the reasoning section extracted from completion
-# (text inside <think> tags, before <code> block)
+# (text inside <think> tags, before fenced code block)
 # ─────────────────────────────────────────
 
 JUDGE_SYSTEM_PROMPT = """You are an expert evaluator of competitive programming reasoning.

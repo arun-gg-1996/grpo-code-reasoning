@@ -60,7 +60,8 @@ from config import (
     TRAIN_SEED,
     GENERATION_BATCH_SIZE,
     VLLM_ENABLE_SLEEP_MODE,
-    STRICT_TRAIN_CODE_TAGS,
+    FORMAT_PENALTY_STRICT,
+    FORMAT_PENALTY_FENCE,
     APPS_CLEAN_PATH,
     LCB_SEEN_PATH,
     SAVE_STEPS,
@@ -130,41 +131,33 @@ def load_problems(path: str, source_label: str) -> list[dict]:
     return problems
 
 
-def build_prompt(problem: dict) -> str:
-    """Build the training prompt for a problem."""
+def build_prompt(problem: dict) -> list[dict]:
+    """Build the training prompt for a problem as chat messages."""
     question = problem.get("question", "")
     is_func_style = is_function_style_problem(problem)
     func_name = get_function_name(problem)
 
     if is_func_style:
-        fn_line = f"- Implement the expected function `{func_name}` exactly.\n" if func_name else ""
-        format_hint = (
-            "Output format requirement (strict):\n"
-            "- Output exactly one <think>...</think> block, then exactly one <code>...</code> block.\n"
-            "- Do not output any text before <think> or after </code>.\n"
-            "- In <think>, the first [STEP] must decide execution format and signature for this problem.\n"
-            "- Use as many [STEP] blocks as needed; keep them concise and avoid filler/repetition.\n"
-            "- This problem is function-style.\n"
-            "- In <code>...</code>, provide only the function/class implementation expected by the prompt.\n"
+        fn_line = (
+            f"Implement the expected function `{func_name}` exactly as specified.\n"
+            if func_name
+            else ""
+        )
+        user_hint = (
+            "This is a function-style problem.\n"
             f"{fn_line}"
-            "- Do NOT read from stdin and do NOT print to stdout unless explicitly required by the statement.\n"
-            "- Never leave <code> empty.\n"
-            "- Inside <code>, output raw Python only (no triple backticks)."
+            "Do NOT read from stdin or print to stdout unless the problem explicitly requires it.\n\n"
         )
     else:
-        format_hint = (
-            "Output format requirement (strict):\n"
-            "- Output exactly one <think>...</think> block, then exactly one <code>...</code> block.\n"
-            "- Do not output any text before <think> or after </code>.\n"
-            "- In <think>, the first [STEP] must decide execution format and I/O handling for this problem.\n"
-            "- Use as many [STEP] blocks as needed; keep them concise and avoid filler/repetition.\n"
-            "- This problem is stdin/stdout style.\n"
-            "- In <code>...</code>, provide a full program that reads input from stdin and prints output.\n"
-            "- Never leave <code> empty.\n"
-            "- Inside <code>, output raw Python only (no triple backticks)."
+        user_hint = (
+            "This is a stdin/stdout problem.\n"
+            "Your solution must read input from stdin and print output to stdout.\n\n"
         )
 
-    return f"{TRAINING_SYSTEM_PROMPT}\n\n{format_hint}\n\n{question}"
+    return [
+        {"role": "system", "content": TRAINING_SYSTEM_PROMPT},
+        {"role": "user", "content": f"{user_hint}{question}"},
+    ]
 
 
 def sample_batch(
@@ -551,7 +544,8 @@ def main():
             "attn_implementation": ATTN_IMPLEMENTATION,
             "lora_rank": LORA_RANK,
             "train_seed": TRAIN_SEED,
-            "strict_train_code_tags": STRICT_TRAIN_CODE_TAGS,
+            "format_penalty_strict": FORMAT_PENALTY_STRICT,
+            "format_penalty_fence": FORMAT_PENALTY_FENCE,
             "resume_from_checkpoint": args.resume_from_checkpoint,
         })
 
@@ -711,7 +705,8 @@ def main():
         "vllm_max_model_length": int(effective_vllm_max_model_length),
         "vllm_enable_sleep_mode": bool(VLLM_ENABLE_SLEEP_MODE),
         "attn_implementation": ATTN_IMPLEMENTATION,
-        "strict_train_code_tags": bool(STRICT_TRAIN_CODE_TAGS),
+        "format_penalty_strict": float(FORMAT_PENALTY_STRICT),
+        "format_penalty_fence": float(FORMAT_PENALTY_FENCE),
         "resume_from_checkpoint": args.resume_from_checkpoint,
         "save_debug_details": bool(args.save_debug_details and (not args.smoke_test)),
         "train_debug_details_path": (

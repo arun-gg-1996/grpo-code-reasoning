@@ -183,7 +183,7 @@ def generate_solutions(
         for pid, output in zip(batch_ids, batch_outputs):
             codes = []
             for gen in output.outputs:
-                code = extract_code(gen.text)
+                code, _extract_mode = extract_code(gen.text)
                 codes.append(code or "")
             results[pid] = codes
 
@@ -470,7 +470,7 @@ def main():
 
         # Score each problem's n generations immediately.
         for row, output in zip(batch_rows, batch_outputs):
-            codes = [extract_code(gen.text) or "" for gen in output.outputs]
+            codes = [extract_code(gen.text)[0] or "" for gen in output.outputs]
             chunk_scores, _ = exec_score_batch(
                 codes=codes,
                 problems=[row["problem_obj"]] * len(codes),
