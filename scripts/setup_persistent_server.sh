@@ -134,7 +134,7 @@ create_venv_with_repair() {
   local err_log
   err_log="$(mktemp)"
 
-  if "$py" -m venv "$venv_dir" 2>"$err_log"; then
+  if "$py" -m venv "$venv_dir" >"$err_log" 2>&1; then
     rm -f "$err_log"
     return 0
   fi
