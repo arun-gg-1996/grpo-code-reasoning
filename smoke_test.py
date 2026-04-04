@@ -63,9 +63,13 @@ def test_config_logic():
     print("  normalize_difficulty: OK")
 
     w0 = get_curriculum_weights(0)
-    assert w0["easy"] == 0.85
-    w800 = get_curriculum_weights(800)
-    assert w800["hard"] == 0.2
+    assert w0["easy"] == 0.70 and w0["medium"] == 0.30 and w0["hard"] == 0.0
+    w80 = get_curriculum_weights(80)
+    assert w80["easy"] == 0.50 and w80["medium"] == 0.50 and w80["hard"] == 0.0
+    w400 = get_curriculum_weights(400)
+    assert w400["easy"] == 0.30 and w400["medium"] == 0.50 and w400["hard"] == 0.20
+    w900 = get_curriculum_weights(900)
+    assert w900["easy"] == 0.15 and w900["medium"] == 0.40 and w900["hard"] == 0.45
     print("  get_curriculum_weights: OK")
 
     p_fn = {"fn_name": "twoSum", "is_leetcode": False}

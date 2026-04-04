@@ -31,7 +31,7 @@ GEMINI_API_KEY = os.environ.get("gemini_api_key", os.environ.get("api_key", ""))
 G = 8  # rollouts per problem (GROUP_SIZE alias below)
 GROUP_SIZE = G  # alias — used throughout reward.py and logging
 BATCH_SIZE = 4  # problems per training step → 4 * 8 = 32 completions per step
-ROLLOUT_TEMPERATURE = 0.7
+ROLLOUT_TEMPERATURE = 0.9
 EVAL_TEMPERATURE = 0.2
 MAX_NEW_TOKENS = 2048
 MAX_PROMPT_LENGTH = 1024
@@ -41,9 +41,9 @@ MAX_PROMPT_LENGTH = 1024
 # Set from literature before cloud run — do not leave None
 # ─────────────────────────────────────────
 
-LEARNING_RATE = 1e-6  # standard for GRPO on 7B (DeepSeek-R1 range: 1e-6 to 3e-6)
+LEARNING_RATE = 5e-6  # increased to improve policy movement in early GRPO
 KL_COEFF = 0.04  # KL penalty — controls drift from reference model
-WARMUP_STEPS = 50  # short warmup, standard for RL fine-tuning
+WARMUP_STEPS = 20  # shorter warmup for faster ramp to effective LR
 MAX_TRAINING_STEPS = 2000  # ~enough for 4 curriculum phases + convergence
 GRADIENT_ACCUMULATION_STEPS = 8  # smoother effective updates without increasing VRAM much
 VLLM_GPU_MEMORY_UTILIZATION = 0.25  # keep vLLM share stable with recent training runs
@@ -153,21 +153,21 @@ EVAL_K_VALUES = [1, 3]  # pass@1 is primary metric, pass@3 for completeness
 # ─────────────────────────────────────────
 
 CURRICULUM = [
-    # Phase 0: easy only — model learns format, [STEP] blocks, basic reward signal
+    # Phase 0: stronger medium exposure from start to increase reward variance
     (0, {
-        "difficulty": {"easy": 0.85, "medium": 0.15, "hard": 0.0}
+        "difficulty": {"easy": 0.70, "medium": 0.30, "hard": 0.0}
     }),
-    # Phase 1: introduce medium earlier
-    (200, {
-        "difficulty": {"easy": 0.60, "medium": 0.40, "hard": 0.0}
+    # Phase 1: equal easy/medium mix early
+    (80, {
+        "difficulty": {"easy": 0.50, "medium": 0.50, "hard": 0.0}
     }),
-    # Phase 2: stronger medium/hard exposure
-    (600, {
-        "difficulty": {"easy": 0.35, "medium": 0.45, "hard": 0.20}
+    # Phase 2: introduce hard sooner
+    (400, {
+        "difficulty": {"easy": 0.30, "medium": 0.50, "hard": 0.20}
     }),
-    # Phase 3: hard-biased late curriculum
-    (1200, {
-        "difficulty": {"easy": 0.20, "medium": 0.35, "hard": 0.45}
+    # Phase 3: hard-focused late curriculum
+    (900, {
+        "difficulty": {"easy": 0.15, "medium": 0.40, "hard": 0.45}
     }),
 ]
 
