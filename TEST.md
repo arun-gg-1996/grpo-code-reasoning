@@ -1,115 +1,52 @@
-# Pre-Train Checklist (A100 Operator Quick Reference)
+# A100 Commands (Run This File)
 
-Use this before every run.
+This is the command sheet for daily use.
 
-## One Command Path
+## 0) Activate Env
 
 ```bash
 source venv/bin/activate
 export PYTORCH_ALLOC_CONF=expandable_segments:True
+```
+
+## 1) Pre-Train Checks (Single Entry Point)
+
+Run this and proceed only if it passes:
+
+```bash
 bash scripts/pretrain_checks.sh
 ```
 
-Pass condition: exit code `0` and message `All pre-train checks passed.`
-
-## Toggle Modes
+Optional flags:
 
 ```bash
-# Skip live Gemini API probe
 SKIP_GEMINI=1 bash scripts/pretrain_checks.sh
-
-# Include trainer smoke run
 RUN_TRAIN_SMOKE=1 bash scripts/pretrain_checks.sh
-
-# Strict env checks
 PRETRAIN_STRICT_ENV=1 bash scripts/pretrain_checks.sh
 PRETRAIN_STRICT_TORCH=1 bash scripts/pretrain_checks.sh
 ```
 
-## Manual Equivalent (Step-by-Step)
-
-### 1) GPU and torch
-
-```bash
-python --version
-python - <<'PY'
-import torch
-print("cuda_available:", torch.cuda.is_available())
-if torch.cuda.is_available():
-    print("cuda_device:", torch.cuda.get_device_name(0))
-PY
-nvidia-smi
-```
-
-### 2) Data files present
-
-```bash
-python - <<'PY'
-import os
-from config import APPS_CLEAN_PATH, LCB_SEEN_PATH, LCB_EVAL_PATH
-for label, path in [
-    ("APPS", APPS_CLEAN_PATH),
-    ("LCB train", LCB_SEEN_PATH),
-    ("LCB eval", LCB_EVAL_PATH),
-]:
-    ok = os.path.exists(path)
-    print(f"{label}: {path} -> {'OK' if ok else 'MISSING'}")
-    assert ok, f"Missing: {path}"
-print("data paths: PASS")
-PY
-```
-
-### 3) Core smoke
-
-```bash
-python smoke_test.py
-```
-
-### 4) Live Gemini probe
-
-```bash
-python - <<'PY'
-from reward.judge import score_batch, get_last_batch_stats
-problems = ["Print hello world", "Given integer n, print n squared"]
-thinks = [
-    "[STEP] Print a constant string to stdout.",
-    "[STEP] Read n, compute n*n, print result.",
-]
-difficulties = ["medium", "medium"]
-scores = score_batch(problems, thinks, difficulties)
-stats = get_last_batch_stats()
-print("scores:", scores)
-print("stats:", stats)
-assert len(scores) == len(problems)
-assert all(0.0 <= s <= 1.0 for s in scores)
-assert stats.get("fallback_fraction", 1.0) < 1.0
-print("gemini probe: PASS")
-PY
-```
-
-## Train / Resume
-
-Start new run:
+## 2) Train
 
 ```bash
 python train.py
 ```
 
-Resume latest checkpoint:
+## 3) Resume
+
+Resume latest:
 
 ```bash
 python train.py --resume-from-checkpoint latest
 ```
 
-Resume specific checkpoint:
+Resume specific:
 
 ```bash
 python train.py --resume-from-checkpoint checkpoints/Qwen2.5-Coder-7B-Instruct-grpo/checkpoint-800
 ```
 
-## Eval Commands
-
-Base model:
+## 4) Eval (Base Model)
 
 ```bash
 python eval.py \
@@ -118,7 +55,9 @@ python eval.py \
   --save-debug-details
 ```
 
-Merged checkpoint:
+## 5) Eval (Trained Checkpoint)
+
+Use merged checkpoint path (must contain `config.json`):
 
 ```bash
 python eval.py \
@@ -127,9 +66,28 @@ python eval.py \
   --save-debug-details
 ```
 
-## Useful Debug Helpers
+If you only have adapter checkpoint (`checkpoint-800`), merge first:
 
-Continue/stop decision:
+```bash
+python - <<'PY'
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+
+base_id = "Qwen/Qwen2.5-Coder-7B-Instruct"
+adapter_path = "checkpoints/Qwen2.5-Coder-7B-Instruct-grpo/checkpoint-800"
+out_path = "checkpoints/Qwen2.5-Coder-7B-Instruct-grpo/merged-checkpoint-800"
+
+base = AutoModelForCausalLM.from_pretrained(base_id, torch_dtype="auto", device_map="auto", trust_remote_code=True)
+tok = AutoTokenizer.from_pretrained(base_id, trust_remote_code=True)
+model = PeftModel.from_pretrained(base, adapter_path)
+model = model.merge_and_unload()
+model.save_pretrained(out_path)
+tok.save_pretrained(out_path)
+print("Saved merged model to:", out_path)
+PY
+```
+
+## 6) W&B Continue/Stop Helper
 
 ```bash
 python scripts/check_continue_stop.py \
@@ -141,14 +99,42 @@ python scripts/check_continue_stop.py \
   --baseline-end 750
 ```
 
-Execution stress:
+## 7) Helper Scripts Index
+
+Pull latest train artifacts from remote (always prompts for host IP):
 
 ```bash
-python scripts/stress_execution.py \
-  --rounds-clean 10 \
-  --rounds-mixed 5 \
-  --batch-size 32 \
-  --workers 16 \
-  --timeout 5
+bash scripts/pull_latest_train.sh
 ```
 
+Pull latest eval artifacts from remote (always prompts for host IP):
+
+```bash
+bash scripts/pull_latest_eval.sh
+```
+
+Analyze one W&B run locally:
+
+```bash
+python scripts/analyze_wandb_run.py --help
+```
+
+Analyze training mistakes with Gemini:
+
+```bash
+python scripts/analyze_train_mistakes_gemini.py --help
+```
+
+Sandbox and execution stress checks:
+
+```bash
+python scripts/stress_execution.py --help
+python scripts/test_sandbox.py
+python scripts/test_fence_sanitization.py
+```
+
+Eval audit helper:
+
+```bash
+bash scripts/audit_latest_eval.sh
+```

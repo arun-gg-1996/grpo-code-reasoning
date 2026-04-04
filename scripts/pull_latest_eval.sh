@@ -4,18 +4,27 @@ set -euo pipefail
 # Pull latest eval artifacts folder from remote server into local results/eval.
 #
 # Defaults are set for current project setup but can be overridden:
-#   REMOTE_HOST, REMOTE_USER, REMOTE_PORT, SSH_KEY, REMOTE_EVAL_DIR, LOCAL_EVAL_DIR
+#   REMOTE_USER, REMOTE_PORT, SSH_KEY, REMOTE_EVAL_DIR, LOCAL_EVAL_DIR
 #
 # Example:
 #   ./scripts/pull_latest_eval.sh
-#   REMOTE_HOST=1.2.3.4 SSH_KEY=~/.ssh/my_key ./scripts/pull_latest_eval.sh
+#   SSH_KEY=~/.ssh/my_key ./scripts/pull_latest_eval.sh
 
-REMOTE_HOST="${REMOTE_HOST:-216.81.248.189}"
 REMOTE_USER="${REMOTE_USER:-ubuntu}"
 REMOTE_PORT="${REMOTE_PORT:-22}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/primeintellect_ed25519}"
 REMOTE_EVAL_DIR="${REMOTE_EVAL_DIR:-/home/${REMOTE_USER}/grpo-code-reasoning/results/eval}"
 LOCAL_EVAL_DIR="${LOCAL_EVAL_DIR:-results/eval}"
+
+if [[ ! -t 0 ]]; then
+  echo "ERROR: This script requires interactive input for remote host/IP." >&2
+  exit 1
+fi
+read -r -p "Enter remote host/IP: " REMOTE_HOST
+if [[ -z "$REMOTE_HOST" ]]; then
+  echo "ERROR: remote host/IP is required." >&2
+  exit 1
+fi
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   cat <<EOF
@@ -26,7 +35,6 @@ Pull latest eval artifacts from remote:
 - pulls summary.json and details.jsonl (if present)
 
 Config via env vars:
-  REMOTE_HOST     (default: $REMOTE_HOST)
   REMOTE_USER     (default: $REMOTE_USER)
   REMOTE_PORT     (default: $REMOTE_PORT)
   SSH_KEY         (default: $SSH_KEY)
