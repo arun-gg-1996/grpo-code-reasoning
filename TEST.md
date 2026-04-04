@@ -11,6 +11,20 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 ## 1) Pre-Train Checks (Single Entry Point)
 
+Before pre-train checks, make sure data files exist on server:
+
+```bash
+ls -lh data/clean/apps_clean.jsonl data/clean/lcb_seen_clean.jsonl data/clean/lcb_unseen_clean.jsonl
+```
+
+If missing, run this from your local machine:
+
+```bash
+rsync -av --progress -e "ssh -i ~/.ssh/primeintellect_ed25519" \
+  "/Users/arun-ghontale/UB/Personal Project/GRPO/data/clean/" \
+  ubuntu@216.81.248.8:/home/ubuntu/grpo-code-reasoning/data/clean/
+```
+
 Run this and proceed only if it passes:
 
 ```bash

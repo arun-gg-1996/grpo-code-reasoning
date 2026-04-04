@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import inspect
 import json
 import logging
 import random
@@ -614,8 +615,8 @@ def main():
         task_type="CAUSAL_LM",
     )
 
-    # GRPO training config
-    training_args = GRPOConfig(
+    # GRPO training config (filter kwargs by installed TRL version for compatibility)
+    grpo_kwargs = dict(
         output_dir=f"checkpoints/{model_name.split('/')[-1]}-grpo",
         num_train_epochs=1,
         max_steps=max_steps,
@@ -655,6 +656,18 @@ def main():
         push_to_hub=PUSH_TO_HUB and not args.smoke_test,
         hub_model_id=HUB_MODEL_ID if (PUSH_TO_HUB and not args.smoke_test) else None,
     )
+    try:
+        supported = set(inspect.signature(GRPOConfig.__init__).parameters.keys())
+        filtered_kwargs = {k: v for k, v in grpo_kwargs.items() if k in supported}
+        dropped = sorted(k for k in grpo_kwargs.keys() if k not in supported)
+        if dropped:
+            logger.warning(
+                "Installed TRL does not support GRPOConfig args: %s. Using compatible subset.",
+                ", ".join(dropped),
+            )
+    except Exception:
+        filtered_kwargs = grpo_kwargs
+    training_args = GRPOConfig(**filtered_kwargs)
 
     # Build reward function
     reward = make_reward_fn()
