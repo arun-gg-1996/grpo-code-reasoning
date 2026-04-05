@@ -379,6 +379,12 @@ def main():
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--output-dir", type=str, default="results/eval")
     parser.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=float,
+        default=None,
+        help="Override vLLM GPU memory utilization fraction.",
+    )
+    parser.add_argument(
         "--save-debug-details",
         action="store_true",
         help="Save per-completion debug JSONL (problem statement, model output, execution score)",
@@ -411,7 +417,10 @@ def main():
     from vllm import LLM, SamplingParams
 
     logger.info(f"Loading model: {args.model}")
-    llm = LLM(model=args.model, trust_remote_code=True)
+    llm_kwargs = {"model": args.model, "trust_remote_code": True}
+    if args.vllm_gpu_memory_utilization is not None:
+        llm_kwargs["gpu_memory_utilization"] = args.vllm_gpu_memory_utilization
+    llm = LLM(**llm_kwargs)
     sampling_params = SamplingParams(
         temperature=args.temperature,
         max_tokens=args.max_tokens,

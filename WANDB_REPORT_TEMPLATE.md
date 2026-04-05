@@ -22,8 +22,8 @@ Read:
 
 Pin:
 - `exec/zero_fraction`
-- `exec/infra_zero_fraction`
-- `exec/model_zero_fraction`
+- `exec/failed_to_run_fraction`
+- `exec/wrong_solution_fraction`
 - `exec/timeout_fraction`
 - `exec/ok_fraction`
 - `exec/error_fraction`
@@ -31,8 +31,8 @@ Pin:
 - `exec/nonzero_mean`
 
 Read:
-- high `infra_zero_fraction` points to format/runtime/infrastructure issues.
-- high `model_zero_fraction` means code executes but fails logic tests.
+- high `failed_to_run_fraction` points to format/runtime/infrastructure issues.
+- high `wrong_solution_fraction` means code executes but fails logic tests.
 - low `nonzero_mean` means capability gap on solved-format outputs.
 
 ## Section 3: Generation Quality
@@ -54,12 +54,15 @@ Read:
 Pin:
 - `judge/fallback_fraction`
 - `judge/json_fraction`
+- `judge/gemini_used_count`
+- `judge/presence_used_count`
 - `judge/retry_count`
 - `judge/rate_limit_count`
 - `judge/consecutive_rate_limit_steps`
 - `timing/reward_judge_s`
 
 Read:
+- high `presence_used_count` means more judge fallbacks are being used in rewards.
 - rising `rate_limit_count` + `retry_count` indicates quota/concurrency pressure.
 - non-zero `consecutive_rate_limit_steps` means sustained judge pressure (not one-off spikes).
 - high `fallback_fraction` indicates degraded judge signal quality.

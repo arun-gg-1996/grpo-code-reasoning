@@ -25,8 +25,8 @@ METRICS = [
     "train/global_step",
     "reward/execution_mean",
     "exec/zero_fraction",
-    "exec/infra_zero_fraction",
-    "exec/model_zero_fraction",
+    "exec/failed_to_run_fraction",
+    "exec/wrong_solution_fraction",
     "exec/empty_fraction",
     "exec/timeout_fraction",
     "exec/error_fraction",
@@ -135,8 +135,8 @@ def main() -> None:
     for key in [
         "reward/execution_mean",
         "exec/zero_fraction",
-        "exec/infra_zero_fraction",
-        "exec/model_zero_fraction",
+        "exec/failed_to_run_fraction",
+        "exec/wrong_solution_fraction",
         "exec/empty_fraction",
         "exec/timeout_fraction",
         "exec/error_fraction",
@@ -164,7 +164,7 @@ def main() -> None:
 
     compare_keys = [
         "reward/execution_mean",
-        "exec/infra_zero_fraction",
+        "exec/failed_to_run_fraction",
         "exec/empty_fraction",
         "exec/timeout_fraction",
         "judge/fallback_fraction",

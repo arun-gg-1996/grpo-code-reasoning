@@ -119,8 +119,8 @@ def evaluate(
     keys = {
         "exec_mean": "reward/execution_mean",
         "zero_frac": "exec/zero_fraction",
-        "infra_zero_frac": "exec/infra_zero_fraction",
-        "model_zero_frac": "exec/model_zero_fraction",
+        "infra_zero_frac": "exec/failed_to_run_fraction",
+        "model_zero_frac": "exec/wrong_solution_fraction",
         "valid_frac": "gen/valid_code_fraction",
         "fallback_frac": "judge/fallback_fraction",
         "retry_count": "judge/retry_count",
@@ -276,8 +276,8 @@ def evaluate(
     )
     reasons_ok.append(f"execution_mean={_fmt(stats['exec_mean'])} trend={_fmt(exec_trend)}")
     reasons_ok.append(f"zero_fraction={_fmt(stats['zero_frac'])} trend={_fmt(zero_trend)}")
-    reasons_ok.append(f"infra_zero_fraction={_fmt(stats['infra_zero_frac'])}")
-    reasons_ok.append(f"model_zero_fraction={_fmt(stats['model_zero_frac'])}")
+    reasons_ok.append(f"failed_to_run_fraction={_fmt(stats['infra_zero_frac'])}")
+    reasons_ok.append(f"wrong_solution_fraction={_fmt(stats['model_zero_frac'])}")
     reasons_ok.append(f"valid_code_fraction={_fmt(stats['valid_frac'])}")
     reasons_ok.append(f"fallback_fraction={_fmt(stats['fallback_frac'])} trend={_fmt(fallback_trend)}")
     reasons_ok.append(
@@ -296,7 +296,7 @@ def evaluate(
     reasons_ok.append(f"kl_mean={_fmt(stats['kl'])}")
 
     if stats["infra_zero_frac"] is not None and stats["infra_zero_frac"] > 0.30:
-        reasons_bad.append("infra_zero_fraction too high (>0.30)")
+        reasons_bad.append("failed_to_run_fraction too high (>0.30)")
     if (
         stats["exec_mean"] is not None
         and stats["exec_mean"] < 0.30

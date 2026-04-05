@@ -21,10 +21,12 @@ import sys
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 
 sys.set_int_max_str_digits(0)  # APPS data contains very large integers in JSON fields
 
 import torch
+import numpy as np
 
 try:
     import wandb
@@ -64,16 +66,30 @@ from config import (
     FORMAT_PENALTY_FENCE,
     APPS_CLEAN_PATH,
     LCB_SEEN_PATH,
+    LCB_EVAL_PATH,
     SAVE_STEPS,
     LOGGING_STEPS,
     WANDB_PROJECT,
     PUSH_TO_HUB,
     HUB_MODEL_ID,
+    EVAL_SYSTEM_PROMPT_STDIO,
+    EVAL_SYSTEM_PROMPT_LEETCODE,
+    EVAL_TEMPERATURE,
+    EVAL_K_VALUES,
     get_curriculum_weights,
     normalize_difficulty,
+    MID_EVAL_ENABLED,
+    MID_EVAL_INTERVAL,
+    MID_EVAL_START_STEP,
+    MID_EVAL_N_GENERATIONS,
+    MID_EVAL_CHECKPOINT_ROOT,
+    MID_EVAL_RESULTS_ROOT,
+    MID_EVAL_SMOKE_N_PROBLEMS,
+    MID_EVAL_SMOKE_N_GENERATIONS,
 )
 from problem_format import is_function_style_problem, get_function_name
 from reward.reward import reward_fn
+from reward.execution import score_batch as exec_score_batch, extract_code
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -208,6 +224,46 @@ def problems_to_dataset(problems: list[dict]) -> Dataset:
     return Dataset.from_list(rows)
 
 
+def _load_eval_problems() -> list[dict]:
+    """Load held-out evaluation problems for in-trainer periodic eval."""
+    eval_problems = []
+    with open(LCB_EVAL_PATH, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            p = json.loads(line)
+            p["difficulty"] = normalize_difficulty(p.get("difficulty", "medium"))
+            p = _normalize_test_cases(p)
+            eval_problems.append(p)
+    return eval_problems
+
+
+def _build_eval_prompt(problem: dict) -> list[dict]:
+    """Build eval prompt using the same logic as eval.py."""
+    question = problem.get("question", "")
+    if problem.get("is_leetcode", False):
+        user_content = question
+        starter = problem.get("starter_code", "")
+        if starter:
+            user_content += f"\n\n{starter}"
+        return [
+            {"role": "system", "content": EVAL_SYSTEM_PROMPT_LEETCODE},
+            {"role": "user", "content": user_content},
+        ]
+    return [
+        {"role": "system", "content": EVAL_SYSTEM_PROMPT_STDIO},
+        {"role": "user", "content": question},
+    ]
+
+
+def _pass_at_k(n: int, c: int, k: int) -> float:
+    """Unbiased pass@k estimator (Chen et al., 2021)."""
+    if n - c < k:
+        return 1.0
+    return 1.0 - float(np.prod(1.0 - k / np.arange(n - c + 1, n + 1)))
+
+
 # ---------------------------------------------------------------------------
 # Reward wrapper for GRPOTrainer
 # ---------------------------------------------------------------------------
@@ -249,6 +305,16 @@ def _bytes_to_gb(n_bytes: float) -> float:
 
 class TimedGRPOTrainer(GRPOTrainer):
     def __init__(self, *args, **kwargs):
+        self._mid_eval_enabled = kwargs.pop("mid_eval_enabled", False)
+        self._mid_eval_n_generations = int(
+            kwargs.pop("mid_eval_n_generations", MID_EVAL_N_GENERATIONS)
+        )
+        self._mid_eval_smoke_n_problems = int(
+            kwargs.pop("mid_eval_smoke_n_problems", MID_EVAL_SMOKE_N_PROBLEMS)
+        )
+        self._mid_eval_smoke_n_generations = int(
+            kwargs.pop("mid_eval_smoke_n_generations", MID_EVAL_SMOKE_N_GENERATIONS)
+        )
         super().__init__(*args, **kwargs)
         self._phase_timing = {
             "timing/generation_s": 0.0,
@@ -268,6 +334,22 @@ class TimedGRPOTrainer(GRPOTrainer):
                 self._nvml_ready = True
             except Exception:
                 self._nvml_ready = False
+        self._last_mid_eval_step = -1
+        self._eval_problems: list[dict] = []
+        if self._mid_eval_enabled:
+            try:
+                self._eval_problems = _load_eval_problems()
+                logger.info(
+                    "[mid-eval] Loaded %d eval problems from %s",
+                    len(self._eval_problems),
+                    LCB_EVAL_PATH,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[mid-eval] Could not load eval problems (%s). Mid-eval disabled.",
+                    e,
+                )
+                self._mid_eval_enabled = False
 
     def _estimate_model_param_bytes(self) -> float:
         total = 0
@@ -368,12 +450,153 @@ class TimedGRPOTrainer(GRPOTrainer):
         self._phase_timing["timing/loss_compute_s"] += time.perf_counter() - t0
         return out
 
+    def _run_mid_training_eval(self, step: int, smoke: bool = False) -> None:
+        """
+        Run periodic full LCB eval using the colocated training vLLM engine.
+        Never raises exceptions; failures are logged via mid_eval/error.
+        """
+        t_start = time.perf_counter()
+        run_id = "no_wandb"
+        if wandb is not None and wandb.run is not None:
+            run_id = wandb.run.id
+        log_dict: dict[str, float | int] = {
+            "mid_eval/step": int(step),
+        }
+        try:
+            if not self._eval_problems:
+                raise RuntimeError("No eval problems loaded")
+
+            tokenizer = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
+            if tokenizer is None:
+                raise RuntimeError("Tokenizer not available on trainer")
+
+            adapter_dir = os.path.join(MID_EVAL_CHECKPOINT_ROOT, run_id, f"step-{step}")
+            os.makedirs(adapter_dir, exist_ok=True)
+            self.model.save_pretrained(adapter_dir)
+            tokenizer.save_pretrained(adapter_dir)
+
+            problems = self._eval_problems
+            n_generations = self._mid_eval_n_generations
+            if smoke:
+                problems = problems[: self._mid_eval_smoke_n_problems]
+                n_generations = self._mid_eval_smoke_n_generations
+
+            llm = getattr(getattr(self, "vllm_generation", None), "llm", None)
+            if llm is None:
+                raise RuntimeError("vLLM handle not available (self.vllm_generation.llm missing)")
+
+            try:
+                llm.wake_up(tags=["weights"])
+                llm.wake_up(tags=["kv_cache"])
+            except TypeError:
+                llm.wake_up()
+            except Exception as e:
+                logger.warning("[mid-eval step=%s] vLLM wake_up failed: %s", step, e)
+
+            tokenized_prompts = []
+            for problem in problems:
+                token_ids = tokenizer.apply_chat_template(
+                    _build_eval_prompt(problem),
+                    tokenize=True,
+                    add_generation_prompt=True,
+                )
+                tokenized_prompts.append({"prompt_token_ids": [int(t) for t in token_ids]})
+
+            from vllm import SamplingParams
+
+            sampling = SamplingParams(
+                n=int(n_generations),
+                temperature=EVAL_TEMPERATURE,
+                max_tokens=MAX_NEW_TOKENS,
+            )
+            outputs = llm.generate(tokenized_prompts, sampling_params=sampling, use_tqdm=False)
+
+            flat_codes: list[str] = []
+            flat_problems: list[dict] = []
+            for problem, req_output in zip(problems, outputs):
+                for out in req_output.outputs:
+                    text = tokenizer.decode(out.token_ids, skip_special_tokens=True)
+                    code, _extract_mode = extract_code(text)
+                    flat_codes.append(code or "")
+                    flat_problems.append(problem)
+
+            scores: list[float] = []
+            if flat_codes:
+                scores, _stats = exec_score_batch(codes=flat_codes, problems=flat_problems)
+
+            buckets: dict[str, list[tuple[int, int]]] = {
+                "all": [],
+                "easy": [],
+                "medium": [],
+                "hard": [],
+            }
+            cursor = 0
+            for problem in problems:
+                curr_scores = scores[cursor: cursor + n_generations]
+                cursor += n_generations
+                n = len(curr_scores)
+                c = sum(1 for s in curr_scores if float(s) >= 0.99)
+                pair = (n, c)
+                buckets["all"].append(pair)
+                diff = normalize_difficulty(problem.get("difficulty", "medium"))
+                if diff in buckets:
+                    buckets[diff].append(pair)
+
+            def _bucket_pass_at_k(pairs: list[tuple[int, int]], k: int) -> float | None:
+                eligible = [(n, c) for n, c in pairs if n >= k]
+                if not eligible:
+                    return None
+                vals = [_pass_at_k(n, c, k) for n, c in eligible]
+                return float(np.mean(vals))
+
+            log_dict["mid_eval/n_problems"] = int(len(problems))
+            for k in EVAL_K_VALUES:
+                for bucket_name, pairs in buckets.items():
+                    v = _bucket_pass_at_k(pairs, int(k))
+                    if v is not None:
+                        log_dict[f"mid_eval/pass_at_{k}_{bucket_name}"] = v
+
+            logger.info(
+                "[mid-eval step=%s] complete: pass@1=%.4f pass@3=%.4f problems=%d n_gen=%d",
+                step,
+                float(log_dict.get("mid_eval/pass_at_1_all", 0.0)),
+                float(log_dict.get("mid_eval/pass_at_3_all", 0.0)),
+                int(log_dict["mid_eval/n_problems"]),
+                n_generations,
+            )
+        except Exception as e:
+            logger.error("[mid-eval step=%s] failed: %s", step, e, exc_info=True)
+            log_dict["mid_eval/error"] = 1
+        finally:
+            log_dict["mid_eval/wall_time_s"] = float(time.perf_counter() - t_start)
+            try:
+                result_dir = os.path.join(MID_EVAL_RESULTS_ROOT, run_id, f"step-{step}")
+                os.makedirs(result_dir, exist_ok=True)
+                summary_path = Path(result_dir) / "summary.json"
+                with open(summary_path, "w") as f:
+                    json.dump(log_dict, f, indent=2)
+            except Exception:
+                logger.warning("[mid-eval step=%s] failed to write summary.json", step)
+            if wandb is not None and wandb.run is not None:
+                wandb.log(log_dict)
+
     def training_step(self, model, inputs, num_items_in_batch):
         t0 = time.perf_counter()
         out = super().training_step(model, inputs, num_items_in_batch)
         self._phase_timing["timing/training_step_s"] += time.perf_counter() - t0
         if self._step % self.current_gradient_accumulation_steps == 0:
             self._flush_step_metrics()
+            step = int(getattr(self.state, "global_step", 0))
+            if (
+                self._mid_eval_enabled
+                and self._eval_problems
+                and step >= MID_EVAL_START_STEP
+                and step % MID_EVAL_INTERVAL == 0
+                and step != self._last_mid_eval_step
+                and (not hasattr(self, "is_world_process_zero") or self.is_world_process_zero())
+            ):
+                self._last_mid_eval_step = step
+                self._run_mid_training_eval(step, smoke=False)
         return out
 
     def _save_checkpoint(self, model, trial):
@@ -447,6 +670,11 @@ def main():
         type=str,
         default=None,
         help="Checkpoint path to resume from, or 'latest' to auto-resume latest in output_dir.",
+    )
+    parser.add_argument(
+        "--test-mid-eval",
+        action="store_true",
+        help="Run one full step-0 mid-eval and exit.",
     )
     args = parser.parse_args()
 
@@ -547,6 +775,10 @@ def main():
             "format_penalty_strict": FORMAT_PENALTY_STRICT,
             "format_penalty_fence": FORMAT_PENALTY_FENCE,
             "resume_from_checkpoint": args.resume_from_checkpoint,
+            "mid_eval_enabled": MID_EVAL_ENABLED,
+            "mid_eval_interval": MID_EVAL_INTERVAL,
+            "mid_eval_start_step": MID_EVAL_START_STEP,
+            "mid_eval_n_generations": MID_EVAL_N_GENERATIONS,
         })
 
     # Load data
@@ -655,6 +887,7 @@ def main():
         vllm_gpu_memory_utilization=vllm_mem,
         vllm_max_model_length=effective_vllm_max_model_length,
         vllm_enable_sleep_mode=VLLM_ENABLE_SLEEP_MODE,
+        num_iterations=2,  # 2 PPO epochs per batch — forces clip to engage; key for LR=1e-5
         shuffle_dataset=False,
         push_to_hub=PUSH_TO_HUB and not args.smoke_test,
         hub_model_id=HUB_MODEL_ID if (PUSH_TO_HUB and not args.smoke_test) else None,
@@ -668,6 +901,12 @@ def main():
                 "Installed TRL does not support GRPOConfig args: %s. Using compatible subset.",
                 ", ".join(dropped),
             )
+            if "num_iterations" in dropped:
+                logger.error(
+                    "CRITICAL: num_iterations was dropped — installed TRL does not support it. "
+                    "Training will use 1 PPO epoch per batch instead of 2. "
+                    "Upgrade TRL (pip install trl --upgrade) to enable multi-epoch PPO."
+                )
     except Exception:
         filtered_kwargs = grpo_kwargs
     training_args = GRPOConfig(**filtered_kwargs)
@@ -684,7 +923,19 @@ def main():
         train_dataset=dataset,
         peft_config=peft_config,
         processing_class=tokenizer,
+        mid_eval_enabled=MID_EVAL_ENABLED and ((not args.smoke_test) or smoke_use_vllm),
+        mid_eval_n_generations=MID_EVAL_N_GENERATIONS,
+        mid_eval_smoke_n_problems=MID_EVAL_SMOKE_N_PROBLEMS,
+        mid_eval_smoke_n_generations=MID_EVAL_SMOKE_N_GENERATIONS,
     )
+
+    if args.test_mid_eval:
+        logger.info("--test-mid-eval: running full step-0 mid-eval and exiting.")
+        trainer._run_mid_training_eval(0, smoke=False)
+        if use_wandb and wandb is not None:
+            wandb.finish()
+        logger.info("--test-mid-eval complete.")
+        return
 
     # Train
     logger.info("Starting GRPO training...")
@@ -707,6 +958,10 @@ def main():
         "attn_implementation": ATTN_IMPLEMENTATION,
         "format_penalty_strict": float(FORMAT_PENALTY_STRICT),
         "format_penalty_fence": float(FORMAT_PENALTY_FENCE),
+        "mid_eval_enabled": bool(MID_EVAL_ENABLED),
+        "mid_eval_interval": int(MID_EVAL_INTERVAL),
+        "mid_eval_start_step": int(MID_EVAL_START_STEP),
+        "mid_eval_n_generations": int(MID_EVAL_N_GENERATIONS),
         "resume_from_checkpoint": args.resume_from_checkpoint,
         "save_debug_details": bool(args.save_debug_details and (not args.smoke_test)),
         "train_debug_details_path": (
@@ -722,6 +977,10 @@ def main():
         resume_arg = args.resume_from_checkpoint
         if resume_arg is not None and resume_arg.strip().lower() == "latest":
             resume_arg = True
+        # Step-0 baseline eval on fresh runs (full eval in normal mode, tiny eval in smoke-test).
+        if trainer._mid_eval_enabled and trainer._eval_problems and (resume_arg is None):
+            trainer._last_mid_eval_step = 0
+            trainer._run_mid_training_eval(0, smoke=args.smoke_test)
         if resume_arg is None:
             trainer.train()
         else:

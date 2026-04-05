@@ -41,7 +41,7 @@ MAX_PROMPT_LENGTH = 1024
 # Set from literature before cloud run — do not leave None
 # ─────────────────────────────────────────
 
-LEARNING_RATE = 5e-6  # increased to improve policy movement in early GRPO
+LEARNING_RATE = 1e-5  # raised from 5e-6: clip_ratio=0.0002 confirmed updates too small at 5e-6
 KL_COEFF = 0.04  # KL penalty — controls drift from reference model
 WARMUP_STEPS = 20  # shorter warmup for faster ramp to effective LR
 MAX_TRAINING_STEPS = 2000  # ~enough for 4 curriculum phases + convergence
@@ -138,6 +138,18 @@ PUSH_TO_HUB = True
 HUB_MODEL_ID = "arun-ghontale/grpo-qwen-coder"
 LOGGING_STEPS = 1  # log every step — only ~2000 steps total, want full resolution
 WANDB_PROJECT = "grpo-code-gen"
+
+# ─────────────────────────────────────────
+# Mid-training evaluation
+# ─────────────────────────────────────────
+MID_EVAL_ENABLED = True
+MID_EVAL_INTERVAL = 100
+MID_EVAL_START_STEP = 100
+MID_EVAL_N_GENERATIONS = 5
+MID_EVAL_CHECKPOINT_ROOT = "checkpoints/mid_eval"
+MID_EVAL_RESULTS_ROOT = "results/mid_eval"
+MID_EVAL_SMOKE_N_PROBLEMS = 5
+MID_EVAL_SMOKE_N_GENERATIONS = 2
 
 # ─────────────────────────────────────────
 # Evaluation

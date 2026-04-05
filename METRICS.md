@@ -8,8 +8,8 @@ For the first 30-60 minutes of a training run, prioritize:
 
 - `reward/execution_mean`
 - `exec/zero_fraction`
-- `exec/infra_zero_fraction`
-- `exec/model_zero_fraction`
+- `exec/failed_to_run_fraction`
+- `exec/wrong_solution_fraction`
 - `gen/valid_code_fraction`
 - `grpo/reward_std_mean`
 - `judge/fallback_fraction`
@@ -17,8 +17,8 @@ For the first 30-60 minutes of a training run, prioritize:
 - `judge/rate_limit_count`
 
 Quick interpretation:
-- High `exec/infra_zero_fraction` = format/runtime/infrastructure failures.
-- High `exec/model_zero_fraction` = code runs but fails tests (capability issue).
+- High `exec/failed_to_run_fraction` = format/runtime/infrastructure failures.
+- High `exec/wrong_solution_fraction` = code runs but fails tests (capability issue).
 - Near-zero `grpo/reward_std_mean` = weak GRPO contrast signal.
 - High `judge/fallback_fraction` with rising retries/rate limits = unreliable judge signal.
 
@@ -55,8 +55,8 @@ Quick interpretation:
 - `exec/empty_fraction`: empty_count / batch_size.
 - `exec/timeout_fraction`: timeout ratio in batch.
 - `exec/zero_fraction`: fraction of completions with execution score 0.
-- `exec/infra_zero_fraction`: zeros caused by error/timeout/empty statuses.
-- `exec/model_zero_fraction`: zeros from `ok` runs that passed 0 tests.
+- `exec/failed_to_run_fraction`: zeros caused by error/timeout/empty statuses.
+- `exec/wrong_solution_fraction`: zeros from `ok` runs that passed 0 tests.
 - `exec/nonzero_mean`: average execution score among non-zero completions only.
 - `exec/apps_mean`: average execution score on APPS samples.
 - `exec/lcb_mean`: average execution score on LCB samples.
@@ -64,13 +64,13 @@ Quick interpretation:
 ### `judge/*`
 - `judge/gemini_mean`: average Gemini judge score for called items.
 - `judge/gemini_calls`: how many completions were sent to Gemini in this batch.
+- `judge/gemini_used_count`: completions where Gemini score was used for reward.
+- `judge/presence_used_count`: completions where presence fallback was used for reward.
 - `judge/total_calls`: total Gemini requests attempted for this batch.
 - `judge/fallback_count`: how many requests used fallback path in reward.
 - `judge/fallback_fraction`: fallback_count / total_calls.
 - `judge/json_count`: how many judge responses returned parseable JSON.
 - `judge/json_fraction`: json_count / total_calls.
-- `judge/step_json_count`: backward-compatible alias of `judge/json_count`.
-- `judge/step_json_fraction`: backward-compatible alias of `judge/json_fraction`.
 - `judge/retry_count`: total retry attempts made in this batch.
 - `judge/rate_limit_count`: number of Gemini 429 responses encountered.
 - `judge/consecutive_rate_limit_steps`: running streak of steps with rate limits.

@@ -320,6 +320,8 @@ def reward_fn(
     final_rewards = []
     reasoning_scores = []
     penalized_exec_scores = []
+    gemini_used_count = 0
+    presence_used_count = 0
 
     for i in range(n):
         source = sources[i]
@@ -329,8 +331,10 @@ def reward_fn(
             reasoning_score = 0.0
         elif gemini_scores[i] is not None:
             reasoning_score = gemini_scores[i]
+            gemini_used_count += 1
         else:
             reasoning_score = presence_scores[i]
+            presence_used_count += 1
 
         reasoning_scores.append(reasoning_score)
 
@@ -369,6 +373,8 @@ def reward_fn(
             "timing/reward_execution_s": exec_time_s,
             "timing/reward_judge_s": judge_time_s,
         },
+        gemini_used_count=gemini_used_count,
+        presence_used_count=presence_used_count,
     )
 
     return final_rewards
@@ -460,6 +466,8 @@ def _log_metrics(
     reasoning_scores, penalized_exec_scores, extract_modes,
     difficulties, sources, think_blocks, codes, completions, exec_stats,
     timing=None,
+    gemini_used_count=0,
+    presence_used_count=0,
 ):
     """Log comprehensive metrics to WandB and emit console warnings on threshold breaches."""
     try:
@@ -523,15 +531,15 @@ def _log_metrics(
             # Gemini stats (default zeros so charts exist even when no judge calls happen)
             "judge/gemini_mean": 0.0,
             "judge/gemini_calls": 0,
+            "judge/gemini_used_count": 0,
+            "judge/presence_used_count": 0,
             "judge/total_calls": 0,
             "judge/fallback_count": 0,
             "judge/fallback_fraction": 0.0,
             "judge/json_count": 0,
             "judge/json_fraction": 0.0,
-            # Backward-compatible aliases.
-            "judge/step_json_count": 0,
-            "judge/step_json_fraction": 0.0,
             "judge/retry_count": 0,
+            "grpo/warn_reward_std_collapse": 0,
             "judge/rate_limit_count": 0,
             "judge/consecutive_rate_limit_steps": 0,
         }
@@ -579,9 +587,6 @@ def _log_metrics(
                 log_dict["judge/json_fraction"] = judge_stats.get(
                     "json_fraction", judge_stats.get("step_json_fraction", 0.0)
                 )
-                # Backward-compatible aliases.
-                log_dict["judge/step_json_count"] = log_dict["judge/json_count"]
-                log_dict["judge/step_json_fraction"] = log_dict["judge/json_fraction"]
                 log_dict["judge/retry_count"] = judge_stats.get("retry_count", 0)
                 log_dict["judge/rate_limit_count"] = judge_stats.get("rate_limit_count", 0)
                 log_dict["judge/consecutive_rate_limit_steps"] = judge_stats.get(
@@ -589,6 +594,9 @@ def _log_metrics(
                 )
             except Exception:
                 pass
+
+        log_dict["judge/gemini_used_count"] = gemini_used_count
+        log_dict["judge/presence_used_count"] = presence_used_count
 
         # Execution zero/low split
         exec_zero_frac = (exec_arr == 0.0).mean()
@@ -601,8 +609,8 @@ def _log_metrics(
                 + log_dict.get("exec/timeout_count", 0)
                 + log_dict.get("exec/empty_count", 0)
             )
-            log_dict["exec/infra_zero_fraction"] = infra_zero_count / n
-            log_dict["exec/model_zero_fraction"] = log_dict.get("exec/zero_ok_count", 0) / n
+            log_dict["exec/failed_to_run_fraction"] = infra_zero_count / n   # errors + timeouts + empty
+            log_dict["exec/wrong_solution_fraction"] = log_dict.get("exec/zero_ok_count", 0) / n  # ran but failed tests
         if exec_nonzero_mean is not None:
             log_dict["exec/nonzero_mean"] = exec_nonzero_mean
 
@@ -632,6 +640,7 @@ def _log_metrics(
                 f"GRPO signal collapsing — reward_std_mean={reward_std_mean:.4f} < 0.05. "
                 "All rollouts getting similar rewards; advantage estimates are noise."
             )
+            log_dict["grpo/warn_reward_std_collapse"] = 1
 
         non_zero_frac = log_dict.get("reward/non_zero_fraction", 1.0)
         if non_zero_frac < 0.2:
@@ -674,12 +683,13 @@ def _log_metrics(
                 "have <think> blocks. Model has stopped reasoning; reasoning reward signal is dead."
             )
 
-        gemini_mean = log_dict.get("judge/gemini_mean")
-        gemini_calls = log_dict.get("judge/gemini_calls", 0)
-        if gemini_calls > 4 and gemini_mean is not None and abs(gemini_mean - 0.5) < 0.02:
+        fallback_fraction = log_dict.get("judge/fallback_fraction", 0.0)
+        total_calls = log_dict.get("judge/total_calls", 0)
+        if total_calls > 4 and fallback_fraction > 0.5:
             warnings_fired["warn/gemini_silent_failure"] = (
-                f"Gemini judge may be silently failing — mean score={gemini_mean:.3f} "
-                "is suspiciously close to the 0.5 fallback value. Check API key and quota."
+                f"Gemini judge failing — {fallback_fraction:.1%} of calls fell back to presence score "
+                f"({int(fallback_fraction * total_calls)}/{total_calls} calls). "
+                "Check API key, quota, and network connectivity."
             )
 
         all_perfect_frac = log_dict.get("grpo/all_perfect_fraction")
@@ -725,7 +735,7 @@ def _log_metrics(
             # Binary flags (1 = fired, 0 = clear) so warnings are visible on the dashboard
             flag_dict = {k: 1 for k in warnings_fired}
             for key in [
-                "grpo/warn_reward_std_collapse", "grpo/warn_all_zero_collapse",
+                "grpo/warn_all_zero_collapse",
                 "warn/format_failure", "warn/exec_formatting_breakdown",
                 "warn/exec_zero_sandbox", "warn/exec_low_nonzero",
                 "warn/reasoning_collapse", "warn/gemini_silent_failure",
