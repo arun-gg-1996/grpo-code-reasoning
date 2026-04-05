@@ -28,6 +28,7 @@ sys.set_int_max_str_digits(0)  # APPS data contains very large integers in JSON 
 
 import numpy as np
 from tqdm import tqdm
+from transformers import AutoTokenizer
 
 from config import (
     LCB_EVAL_PATH,
@@ -48,6 +49,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 logger = logging.getLogger(__name__)
 logging.getLogger("vllm").setLevel(logging.WARNING)
 os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
+_chat_template_warned = False
 
 
 def _slugify_model_name(model: str) -> str:
@@ -64,6 +66,52 @@ def _fmt_seconds(sec: float) -> str:
     if h > 0:
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
+
+
+def _build_eval_messages(problem: dict) -> list[dict]:
+    """Build chat messages for eval prompt rendering."""
+    question = problem.get("question", "")
+    is_lc = problem.get("is_leetcode", False)
+    if is_lc:
+        user_content = question
+        starter = problem.get("starter_code", "")
+        if starter:
+            user_content += f"\n\n{starter}"
+        return [
+            {"role": "system", "content": EVAL_SYSTEM_PROMPT_LEETCODE},
+            {"role": "user", "content": user_content},
+        ]
+    return [
+        {"role": "system", "content": EVAL_SYSTEM_PROMPT_STDIO},
+        {"role": "user", "content": question},
+    ]
+
+
+def _render_eval_prompt(tokenizer, problem: dict) -> str:
+    """
+    Render eval prompt with model chat template for instruct-model consistency.
+    Falls back to legacy flat string if template is unavailable.
+    """
+    global _chat_template_warned
+    messages = _build_eval_messages(problem)
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    except Exception:
+        if not _chat_template_warned:
+            logger.warning(
+                "Tokenizer chat template unavailable; falling back to legacy flat-string prompts."
+            )
+            _chat_template_warned = True
+        question = problem.get("question", "")
+        if problem.get("is_leetcode", False):
+            prompt = f"{EVAL_SYSTEM_PROMPT_LEETCODE}\n\n{question}"
+            starter = problem.get("starter_code", "")
+            if starter:
+                prompt += f"\n\n{starter}"
+            return prompt
+        return f"{EVAL_SYSTEM_PROMPT_STDIO}\n\n{question}"
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +185,7 @@ def generate_solutions(
 
     logger.info(f"Loading model: {model_path}")
     llm = LLM(model=model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
     sampling_params = SamplingParams(
         temperature=temperature,
@@ -149,16 +198,7 @@ def generate_solutions(
     problem_ids = []
     for p in problems:
         pid = p.get("question_id") or p.get("problem_id", "unknown")
-        question = p.get("question", "")
-        is_lc = p.get("is_leetcode", False)
-
-        if is_lc:
-            prompt = f"{EVAL_SYSTEM_PROMPT_LEETCODE}\n\n{question}"
-            starter = p.get("starter_code", "")
-            if starter:
-                prompt += f"\n\n{starter}"
-        else:
-            prompt = f"{EVAL_SYSTEM_PROMPT_STDIO}\n\n{question}"
+        prompt = _render_eval_prompt(tokenizer, p)
 
         prompts.append(prompt)
         problem_ids.append(pid)
@@ -421,6 +461,7 @@ def main():
     if args.vllm_gpu_memory_utilization is not None:
         llm_kwargs["gpu_memory_utilization"] = args.vllm_gpu_memory_utilization
     llm = LLM(**llm_kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     sampling_params = SamplingParams(
         temperature=args.temperature,
         max_tokens=args.max_tokens,
@@ -432,14 +473,7 @@ def main():
     for p in problems:
         pid = p.get("question_id") or p.get("problem_id", "unknown")
         question = p.get("question", "")
-        is_lc = p.get("is_leetcode", False)
-        if is_lc:
-            prompt = f"{EVAL_SYSTEM_PROMPT_LEETCODE}\n\n{question}"
-            starter = p.get("starter_code", "")
-            if starter:
-                prompt += f"\n\n{starter}"
-        else:
-            prompt = f"{EVAL_SYSTEM_PROMPT_STDIO}\n\n{question}"
+        prompt = _render_eval_prompt(tokenizer, p)
 
         prompts.append(prompt)
         problem_rows.append(
