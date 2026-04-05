@@ -578,6 +578,7 @@ class TimedGRPOTrainer(GRPOTrainer):
             except Exception:
                 logger.warning("[mid-eval step=%s] failed to write summary.json", step)
             if wandb is not None and wandb.run is not None:
+                log_dict["train/global_step"] = int(step)
                 wandb.log(log_dict)
 
     def training_step(self, model, inputs, num_items_in_batch):
