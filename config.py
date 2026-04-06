@@ -41,18 +41,18 @@ MAX_PROMPT_LENGTH = 1024
 # Set from literature before cloud run — do not leave None
 # ─────────────────────────────────────────
 
-LEARNING_RATE = 2e-5  # increased to boost policy movement/clip engagement
-KL_COEFF = 0.04  # KL penalty — controls drift from reference model
+LEARNING_RATE = 5e-5  # aggressive move: increase policy update magnitude
+KL_COEFF = 0.02  # loosen KL anchor slightly to allow stronger exploration
 WARMUP_STEPS = 20  # shorter warmup for faster ramp to effective LR
 MAX_TRAINING_STEPS = 2700  # extended run for better coverage with no-replacement sampling
-GRADIENT_ACCUMULATION_STEPS = 8  # smoother effective updates without increasing VRAM much
+GRADIENT_ACCUMULATION_STEPS = 4  # fewer stale micro-updates per generated batch
 VLLM_GPU_MEMORY_UTILIZATION = 0.25  # keep vLLM share stable with recent training runs
 VLLM_MODE = "colocate"  # explicitly run colocated vLLM with trainer on single-GPU setup
 TRAIN_SEED = 42  # deterministic curriculum pre-build sampling
 
 # Generation/memory knobs for colocated vLLM.
 # Keep per-step generations in smaller chunks to reduce peak memory.
-GENERATION_BATCH_SIZE = 24
+GENERATION_BATCH_SIZE = 16
 # vLLM KV cache cap: prompt + completion budget used by this project.
 VLLM_MAX_MODEL_LENGTH = MAX_PROMPT_LENGTH + MAX_NEW_TOKENS
 # In colocate mode, offload vLLM state during optimizer step to free VRAM headroom.

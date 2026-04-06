@@ -1005,6 +1005,7 @@ def main():
         generation_batch_size=min(GENERATION_BATCH_SIZE, batch_size * group_size),
         temperature=rollout_temperature,
         beta=KL_COEFF,
+        loss_type="grpo",
         logging_steps=LOGGING_STEPS,
         save_steps=save_steps,
         seed=TRAIN_SEED,
@@ -1035,7 +1036,7 @@ def main():
         vllm_gpu_memory_utilization=vllm_mem,
         vllm_max_model_length=effective_vllm_max_model_length,
         vllm_enable_sleep_mode=VLLM_ENABLE_SLEEP_MODE,
-        num_iterations=2,  # 2 PPO epochs per batch — forces clip to engage; key for LR=1e-5
+        num_iterations=2,  # keep 2 PPO epochs; clip should engage with stronger updates
         shuffle_dataset=False,
         push_to_hub=PUSH_TO_HUB and not args.smoke_test,
         hub_model_id=HUB_MODEL_ID if (PUSH_TO_HUB and not args.smoke_test) else None,
