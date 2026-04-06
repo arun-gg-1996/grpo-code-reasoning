@@ -776,21 +776,27 @@ def _log_metrics(
         log_dict["observer/critical_count"] = len(critical_fired)
         log_dict["observer/critical_flag"] = 1 if critical_fired else 0
 
-        # Log to wandb: metrics + binary warning flags
+        # Log to wandb in a single row: metrics + binary warning flags
         if wandb is not None and wandb.run is not None:
-            wandb.log(log_dict)
-            # Binary flags (1 = fired, 0 = clear) so warnings are visible on the dashboard
+            # Binary flags (1 = fired, 0 = clear) so warnings align with main metrics.
             flag_dict = {k: 1 for k in warnings_fired}
             for key in [
+                "grpo/warn_reward_std_collapse",
                 "grpo/warn_all_zero_collapse",
-                "warn/format_failure", "warn/exec_formatting_breakdown",
-                "warn/exec_zero_sandbox", "warn/exec_low_nonzero",
-                "warn/reasoning_collapse", "warn/gemini_silent_failure",
-                "warn/problems_too_easy", "warn/empty_completions", "warn/high_timeout_rate",
+                "warn/format_failure",
+                "warn/exec_formatting_breakdown",
+                "warn/exec_zero_sandbox",
+                "warn/exec_low_nonzero",
+                "warn/reasoning_collapse",
+                "warn/gemini_silent_failure",
+                "warn/problems_too_easy",
+                "warn/empty_completions",
+                "warn/high_timeout_rate",
             ]:
                 if key not in flag_dict:
                     flag_dict[key] = 0
-            wandb.log(flag_dict)
+            log_dict.update(flag_dict)
+            wandb.log(log_dict)
             # Send push alert for each fired warning
             for key, msg in warnings_fired.items():
                 try:

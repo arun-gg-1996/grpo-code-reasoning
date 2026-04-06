@@ -523,10 +523,6 @@ class TimedGRPOTrainer(GRPOTrainer):
             "timing/step_total_s": float(step_total_s),
             **{k: float(v) for k, v in self._phase_timing.items()},
             "gpu/model_param_gb_est": _bytes_to_gb(self._model_param_bytes),
-            # Universal train-side reference lines.
-            "train/kl_ref_floor": float(TRAIN_KL_REF_FLOOR),
-            "train/kl_ref_ceiling": float(TRAIN_KL_REF_CEILING),
-            "train/clip_ratio/ref_min": float(TRAIN_CLIP_RATIO_REF_MIN),
             # Curriculum context overlays (step-function + change event spike).
             "curriculum/phase": int(curr_phase),
             "curriculum/easy_weight": float(curr_weights.get("easy", 0.0)),
@@ -564,6 +560,21 @@ class TimedGRPOTrainer(GRPOTrainer):
         out = super()._compute_loss(model, inputs)
         self._phase_timing["timing/loss_compute_s"] += time.perf_counter() - t0
         return out
+
+    def log(self, logs, start_time=None):
+        """
+        Inject universal train reference lines into TRL's primary log row so
+        overlays align naturally with train/kl and train/clip_ratio metrics.
+        """
+        if isinstance(logs, dict):
+            logs["train/kl_ref_floor"] = float(TRAIN_KL_REF_FLOOR)
+            logs["train/kl_ref_ceiling"] = float(TRAIN_KL_REF_CEILING)
+            logs["train/clip_ratio/ref_min"] = float(TRAIN_CLIP_RATIO_REF_MIN)
+        try:
+            return super().log(logs, start_time=start_time)
+        except TypeError:
+            # Backward-compatible path for Trainer variants without start_time kwarg.
+            return super().log(logs)
 
     def _run_mid_training_eval(self, step: int, smoke: bool = False) -> None:
         """
