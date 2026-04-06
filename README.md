@@ -58,6 +58,7 @@ Make sure dataset files exist on server:
 - `data/clean/apps_clean.jsonl`
 - `data/clean/lcb_seen_clean.jsonl`
 - `data/clean/lcb_unseen_clean.jsonl`
+- `data/clean/taco_verified_clean.jsonl`
 
 If missing, sync from your local machine to server:
 
@@ -70,7 +71,7 @@ rsync -av --progress -e "ssh -i ~/.ssh/primeintellect_ed25519" \
 Then verify on server:
 
 ```bash
-ls -lh data/clean/apps_clean.jsonl data/clean/lcb_seen_clean.jsonl data/clean/lcb_unseen_clean.jsonl
+ls -lh data/clean/apps_clean.jsonl data/clean/lcb_seen_clean.jsonl data/clean/lcb_unseen_clean.jsonl data/clean/taco_verified_clean.jsonl
 ```
 
 Use exactly one preflight script:

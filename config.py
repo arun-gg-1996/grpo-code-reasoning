@@ -33,7 +33,7 @@ GROUP_SIZE = G  # alias — used throughout reward.py and logging
 BATCH_SIZE = 4  # problems per training step → 4 * 8 = 32 completions per step
 ROLLOUT_TEMPERATURE = 0.9
 EVAL_TEMPERATURE = 0.2
-MAX_NEW_TOKENS = 2048
+MAX_NEW_TOKENS = 1792
 MAX_PROMPT_LENGTH = 1024
 
 # ─────────────────────────────────────────
@@ -41,10 +41,10 @@ MAX_PROMPT_LENGTH = 1024
 # Set from literature before cloud run — do not leave None
 # ─────────────────────────────────────────
 
-LEARNING_RATE = 1e-5  # raised from 5e-6: clip_ratio=0.0002 confirmed updates too small at 5e-6
+LEARNING_RATE = 2e-5  # increased to boost policy movement/clip engagement
 KL_COEFF = 0.04  # KL penalty — controls drift from reference model
 WARMUP_STEPS = 20  # shorter warmup for faster ramp to effective LR
-MAX_TRAINING_STEPS = 2000  # ~enough for 4 curriculum phases + convergence
+MAX_TRAINING_STEPS = 2700  # extended run for better coverage with no-replacement sampling
 GRADIENT_ACCUMULATION_STEPS = 8  # smoother effective updates without increasing VRAM much
 VLLM_GPU_MEMORY_UTILIZATION = 0.25  # keep vLLM share stable with recent training runs
 VLLM_MODE = "colocate"  # explicitly run colocated vLLM with trainer on single-GPU setup
@@ -52,7 +52,7 @@ TRAIN_SEED = 42  # deterministic curriculum pre-build sampling
 
 # Generation/memory knobs for colocated vLLM.
 # Keep per-step generations in smaller chunks to reduce peak memory.
-GENERATION_BATCH_SIZE = 16
+GENERATION_BATCH_SIZE = 24
 # vLLM KV cache cap: prompt + completion budget used by this project.
 VLLM_MAX_MODEL_LENGTH = MAX_PROMPT_LENGTH + MAX_NEW_TOKENS
 # In colocate mode, offload vLLM state during optimizer step to free VRAM headroom.
@@ -68,8 +68,8 @@ FORMAT_PENALTY_FENCE = 1.00
 # LoRA config
 # ─────────────────────────────────────────
 
-LORA_RANK = 16
-LORA_ALPHA = 32  # keep alpha at 2x rank
+LORA_RANK = 64
+LORA_ALPHA = 128  # keep alpha at 2x rank
 LORA_DROPOUT = 0.05
 LORA_TARGET_MODULES = [
     "q_proj", "v_proj", "k_proj", "o_proj",  # attention layers
@@ -99,13 +99,22 @@ HARD_PRESENCE_WEIGHT = 0.7
 
 REWARD_STD_WARNING_THRESHOLD = 0.05  # reward_std below this → diversity collapse warning
 
+# Universal W&B reference-line thresholds (stable across experiments).
+TRAIN_KL_REF_FLOOR = 0.001
+TRAIN_KL_REF_CEILING = 0.10
+TRAIN_CLIP_RATIO_REF_MIN = 0.005
+GRPO_ALL_ZERO_REF_MAX = 0.50
+GRPO_ALL_PERFECT_REF_MAX = 0.50
+# Dynamic baseline window: post-warmup first N optimizer steps.
+DYNAMIC_BASELINE_WINDOW_STEPS = 30
+
 # ─────────────────────────────────────────
 # Gemini judge
 # ─────────────────────────────────────────
 
 # Max concurrent Gemini calls in one reward batch.
 # Keep modest to reduce 429 rate-limit bursts.
-GEMINI_MAX_WORKERS = 2
+GEMINI_MAX_WORKERS = 8
 # Timeout per call (seconds).
 GEMINI_TIMEOUT = 30
 # Judge response is short; cap output tokens.
@@ -143,8 +152,12 @@ WANDB_PROJECT = "grpo-code-gen"
 # Mid-training evaluation
 # ─────────────────────────────────────────
 MID_EVAL_ENABLED = True
-MID_EVAL_INTERVAL = 100
-MID_EVAL_START_STEP = 100
+# Dense early evals for rapid signal, then every 200 steps.
+MID_EVAL_STEPS = frozenset([
+    100, 200, 300,
+    500, 700, 900, 1100, 1300, 1500,
+    1700, 1900, 2100, 2300, 2500, 2700,
+])
 MID_EVAL_N_GENERATIONS = 5
 MID_EVAL_CHECKPOINT_ROOT = "checkpoints/mid_eval"
 MID_EVAL_RESULTS_ROOT = "results/mid_eval"
@@ -165,22 +178,10 @@ EVAL_K_VALUES = [1, 3]  # pass@1 is primary metric, pass@3 for completeness
 # ─────────────────────────────────────────
 
 CURRICULUM = [
-    # Phase 0: stronger medium exposure from start to increase reward variance
-    (0, {
-        "difficulty": {"easy": 0.70, "medium": 0.30, "hard": 0.0}
-    }),
-    # Phase 1: equal easy/medium mix early
-    (80, {
-        "difficulty": {"easy": 0.50, "medium": 0.50, "hard": 0.0}
-    }),
-    # Phase 2: introduce hard sooner
-    (400, {
-        "difficulty": {"easy": 0.30, "medium": 0.50, "hard": 0.20}
-    }),
-    # Phase 3: hard-focused late curriculum
-    (900, {
-        "difficulty": {"easy": 0.15, "medium": 0.40, "hard": 0.45}
-    }),
+    (0, {"difficulty": {"easy": 0.70, "medium": 0.30, "hard": 0.00}}),
+    (80, {"difficulty": {"easy": 0.45, "medium": 0.50, "hard": 0.05}}),
+    (250, {"difficulty": {"easy": 0.30, "medium": 0.50, "hard": 0.20}}),
+    (700, {"difficulty": {"easy": 0.15, "medium": 0.40, "hard": 0.45}}),
 ]
 
 
@@ -212,12 +213,22 @@ def get_curriculum_weights(step: int) -> dict:
     return weights["difficulty"]
 
 
+def get_curriculum_phase(step: int) -> int:
+    """Return 0-based curriculum phase index for a training step."""
+    phase = 0
+    for idx, (from_step, _w) in enumerate(CURRICULUM):
+        if step >= from_step:
+            phase = idx
+    return phase
+
+
 # ─────────────────────────────────────────
 # Data paths
 # ─────────────────────────────────────────
 
 APPS_CLEAN_PATH = "data/clean/apps_clean.jsonl"
 LCB_SEEN_PATH = "data/clean/lcb_seen_clean.jsonl"
+TACO_CLEAN_PATH = "data/clean/taco_verified_clean.jsonl"
 LCB_EVAL_PATH = "data/clean/lcb_unseen_clean.jsonl"  # held out — eval only, never train
 FAILED_DIR = "data/failed"
 

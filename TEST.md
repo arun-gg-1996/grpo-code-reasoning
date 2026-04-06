@@ -14,7 +14,7 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 Before pre-train checks, make sure data files exist on server:
 
 ```bash
-ls -lh data/clean/apps_clean.jsonl data/clean/lcb_seen_clean.jsonl data/clean/lcb_unseen_clean.jsonl
+ls -lh data/clean/apps_clean.jsonl data/clean/lcb_seen_clean.jsonl data/clean/lcb_unseen_clean.jsonl data/clean/taco_verified_clean.jsonl
 ```
 
 If missing, run this from your local machine:
@@ -43,7 +43,17 @@ PRETRAIN_STRICT_TORCH=1 bash scripts/pretrain_checks.sh
 ## 2) Train
 
 ```bash
-python train.py
+python train.py --save-debug-details
+```
+
+Recommended detached run with `screen`:
+
+```bash
+screen -S grpo-train
+python train.py --save-debug-details
+# Detach: Ctrl+A then D
+# Reattach later:
+screen -r grpo-train
 ```
 
 ## 3) Resume
@@ -51,13 +61,13 @@ python train.py
 Resume latest:
 
 ```bash
-python train.py --resume-from-checkpoint latest
+python train.py --resume-from-checkpoint latest --save-debug-details
 ```
 
 Resume specific:
 
 ```bash
-python train.py --resume-from-checkpoint checkpoints/Qwen2.5-Coder-7B-Instruct-grpo/checkpoint-800
+python train.py --resume-from-checkpoint checkpoints/Qwen2.5-Coder-7B-Instruct-grpo/checkpoint-800 --save-debug-details
 ```
 
 ## 4) Eval (Base Model)

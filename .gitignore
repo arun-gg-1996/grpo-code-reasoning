@@ -21,6 +21,7 @@ env/
 # Environment variables — contains API keys, never commit
 .env
 .env.*
+.gcloud
 
 # Data — large files, transfer separately via rsync
 data/clean/*.jsonl

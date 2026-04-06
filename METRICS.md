@@ -30,9 +30,9 @@ Quick interpretation:
 - `reward/non_zero_fraction`: fraction of completions with reward > 0.
 - `reward/execution_mean`: average execution score before reward weighting.
 - `reward/reasoning_mean`: average reasoning score before reward weighting.
-- `reward/mean_easy|medium|hard`: average final reward for each difficulty.
-- `reward/execution_easy|medium|hard`: average execution score by difficulty.
-- `reward/reasoning_easy|medium|hard`: average reasoning score by difficulty.
+- `reward/mean_easy`, `reward/mean_medium`, `reward/mean_hard`: average final reward by difficulty (logged when that difficulty appears in the batch).
+- `reward/execution_easy`, `reward/execution_medium`, `reward/execution_hard`: average execution score by difficulty (logged when that difficulty appears in the batch).
+- `reward/reasoning_easy`, `reward/reasoning_medium`, `reward/reasoning_hard`: average reasoning score by difficulty (logged when that difficulty appears in the batch).
 - `reward/apps_mean`: average final reward on APPS source rows.
 - `reward/lcb_mean`: average final reward on LCB source rows.
 
@@ -99,6 +99,10 @@ Fallback behavior note:
 - `data/processed_total`: cumulative number of processed completion rows.
 - `data/apps_processed|lcb_processed`: cumulative processed rows by source.
 - `data/easy_processed|medium_processed|hard_processed`: cumulative processed rows by difficulty.
+
+Source-tracking note:
+- TACO rows are currently counted under APPS source counters (`data/apps_seen`, `data/apps_processed`).
+- There is no separate `data/taco_*` metric namespace yet.
 
 ## Timing (`timing/*`)
 

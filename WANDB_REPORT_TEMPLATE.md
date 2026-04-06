@@ -11,12 +11,12 @@ Pin:
 - `grpo/reward_std_mean`
 - `grpo/all_zero_fraction`
 - `grpo/all_perfect_fraction`
-- `kl` (or `train/kl` depending TRL/W&B naming)
+- `train/kl`
 
 Read:
 - `grpo/reward_std_mean` near 0 means weak GRPO contrast.
 - high `grpo/all_zero_fraction` means collapse on current distribution.
-- if `kl` is missing, try pinning `train/kl` or `objective/kl`.
+- use `train/kl` as the canonical KL metric for this project.
 
 ## Section 2: Execution Health
 

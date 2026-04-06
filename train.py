@@ -66,6 +66,7 @@ from config import (
     FORMAT_PENALTY_FENCE,
     APPS_CLEAN_PATH,
     LCB_SEEN_PATH,
+    TACO_CLEAN_PATH,
     LCB_EVAL_PATH,
     SAVE_STEPS,
     LOGGING_STEPS,
@@ -77,10 +78,14 @@ from config import (
     EVAL_TEMPERATURE,
     EVAL_K_VALUES,
     get_curriculum_weights,
+    get_curriculum_phase,
     normalize_difficulty,
+    TRAIN_KL_REF_FLOOR,
+    TRAIN_KL_REF_CEILING,
+    TRAIN_CLIP_RATIO_REF_MIN,
+    DYNAMIC_BASELINE_WINDOW_STEPS,
     MID_EVAL_ENABLED,
-    MID_EVAL_INTERVAL,
-    MID_EVAL_START_STEP,
+    MID_EVAL_STEPS,
     MID_EVAL_N_GENERATIONS,
     MID_EVAL_CHECKPOINT_ROOT,
     MID_EVAL_RESULTS_ROOT,
@@ -176,10 +181,21 @@ def build_prompt(problem: dict) -> list[dict]:
     ]
 
 
+def build_diff_queues(problems_by_diff: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """Create per-difficulty shuffled queues for no-replacement sampling."""
+    queues = {}
+    for diff, problems in problems_by_diff.items():
+        shuffled = problems[:]
+        random.shuffle(shuffled)
+        queues[diff] = shuffled
+    return queues
+
+
 def sample_batch(
     problems_by_diff: dict[str, list[dict]],
     step: int,
     batch_size: int,
+    queues: dict[str, list[dict]] | None = None,
 ) -> list[dict]:
     """
     Sample a batch of problems using curriculum weights for the current step.
@@ -202,7 +218,14 @@ def sample_batch(
         probs = [p / total for p in probs]
 
         diff = random.choices(diffs, weights=probs, k=1)[0]
-        problem = random.choice(problems_by_diff[diff])
+        if queues is not None:
+            if not queues[diff]:
+                refill = problems_by_diff[diff][:]
+                random.shuffle(refill)
+                queues[diff].extend(refill)
+            problem = queues[diff].pop()
+        else:
+            problem = random.choice(problems_by_diff[diff])
         sampled.append(problem)
 
     return sampled
@@ -334,6 +357,14 @@ class TimedGRPOTrainer(GRPOTrainer):
                 self._nvml_ready = True
             except Exception:
                 self._nvml_ready = False
+        # Dynamic operational baseline (computed from post-warmup early window).
+        self._step_total_baseline_s: float | None = None
+        self._step_total_baseline_samples: list[float] = []
+        # Curriculum visual context.
+        self._last_curriculum_phase = get_curriculum_phase(0)
+        # Mid-eval dynamic baseline from step-0 pass@k metrics.
+        self._mid_eval_baseline: dict[str, float] = {}
+        self._mid_eval_baseline_load_attempted = False
         self._last_mid_eval_step = -1
         self._eval_problems: list[dict] = []
         if self._mid_eval_enabled:
@@ -350,6 +381,57 @@ class TimedGRPOTrainer(GRPOTrainer):
                     e,
                 )
                 self._mid_eval_enabled = False
+        if self._mid_eval_enabled:
+            self._load_mid_eval_baseline_if_needed()
+
+    @staticmethod
+    def _current_run_id() -> str:
+        if wandb is not None and wandb.run is not None:
+            return wandb.run.id
+        return "no_wandb"
+
+    def _mid_eval_baseline_path(self) -> Path:
+        return Path(MID_EVAL_RESULTS_ROOT) / self._current_run_id() / "baseline.json"
+
+    def _load_mid_eval_baseline_if_needed(self) -> None:
+        if self._mid_eval_baseline_load_attempted:
+            return
+        self._mid_eval_baseline_load_attempted = True
+        path = self._mid_eval_baseline_path()
+        if not path.exists():
+            return
+        try:
+            with open(path, "r") as f:
+                payload = json.load(f)
+            metrics = payload.get("metrics", payload)
+            self._mid_eval_baseline = {
+                str(k): float(v)
+                for k, v in metrics.items()
+                if isinstance(v, (int, float)) and str(k).startswith("mid_eval/pass_at_")
+            }
+            if self._mid_eval_baseline:
+                logger.info("[mid-eval] Loaded baseline metrics from %s", path)
+        except Exception as e:
+            logger.warning("[mid-eval] Failed to load baseline from %s: %s", path, e)
+
+    def _persist_mid_eval_baseline(self, step: int) -> None:
+        if not self._mid_eval_baseline:
+            return
+        path = self._mid_eval_baseline_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w") as f:
+                json.dump(
+                    {
+                        "step": int(step),
+                        "run_id": self._current_run_id(),
+                        "metrics": self._mid_eval_baseline,
+                    },
+                    f,
+                    indent=2,
+                )
+        except Exception as e:
+            logger.warning("[mid-eval] Failed to persist baseline to %s: %s", path, e)
 
     def _estimate_model_param_bytes(self) -> float:
         total = 0
@@ -415,12 +497,45 @@ class TimedGRPOTrainer(GRPOTrainer):
             self._step_wall_start = time.perf_counter()
             return
 
+        step = int(getattr(self.state, "global_step", 0))
         step_total_s = time.perf_counter() - self._step_wall_start
+        warmup_steps = int(getattr(self.args, "warmup_steps", WARMUP_STEPS) or 0)
+        baseline_end_step = warmup_steps + int(DYNAMIC_BASELINE_WINDOW_STEPS)
+        if (
+            self._step_total_baseline_s is None
+            and step > warmup_steps
+            and step <= baseline_end_step
+        ):
+            self._step_total_baseline_samples.append(float(step_total_s))
+        if (
+            self._step_total_baseline_s is None
+            and step > baseline_end_step
+            and self._step_total_baseline_samples
+        ):
+            self._step_total_baseline_s = float(np.median(self._step_total_baseline_samples))
+
+        curr_weights = get_curriculum_weights(step)
+        curr_phase = get_curriculum_phase(step)
+        curriculum_change = int(curr_phase != self._last_curriculum_phase)
+        self._last_curriculum_phase = curr_phase
+
         log_dict = {
             "timing/step_total_s": float(step_total_s),
             **{k: float(v) for k, v in self._phase_timing.items()},
             "gpu/model_param_gb_est": _bytes_to_gb(self._model_param_bytes),
+            # Universal train-side reference lines.
+            "train/kl_ref_floor": float(TRAIN_KL_REF_FLOOR),
+            "train/kl_ref_ceiling": float(TRAIN_KL_REF_CEILING),
+            "train/clip_ratio/ref_min": float(TRAIN_CLIP_RATIO_REF_MIN),
+            # Curriculum context overlays (step-function + change event spike).
+            "curriculum/phase": int(curr_phase),
+            "curriculum/easy_weight": float(curr_weights.get("easy", 0.0)),
+            "curriculum/medium_weight": float(curr_weights.get("medium", 0.0)),
+            "curriculum/hard_weight": float(curr_weights.get("hard", 0.0)),
+            "events/curriculum_change": curriculum_change,
         }
+        if self._step_total_baseline_s is not None:
+            log_dict["timing/step_total_s_baseline"] = float(self._step_total_baseline_s)
 
         opt_bytes = self._estimate_optimizer_state_bytes()
         if opt_bytes is not None:
@@ -456,9 +571,8 @@ class TimedGRPOTrainer(GRPOTrainer):
         Never raises exceptions; failures are logged via mid_eval/error.
         """
         t_start = time.perf_counter()
-        run_id = "no_wandb"
-        if wandb is not None and wandb.run is not None:
-            run_id = wandb.run.id
+        run_id = self._current_run_id()
+        self._load_mid_eval_baseline_if_needed()
         log_dict: dict[str, float | int] = {
             "mid_eval/step": int(step),
         }
@@ -556,6 +670,22 @@ class TimedGRPOTrainer(GRPOTrainer):
                     if v is not None:
                         log_dict[f"mid_eval/pass_at_{k}_{bucket_name}"] = v
 
+            # Step-0 eval defines the per-run dynamic pass@k baseline.
+            if int(step) == 0:
+                self._mid_eval_baseline = {
+                    k: float(v)
+                    for k, v in log_dict.items()
+                    if k.startswith("mid_eval/pass_at_")
+                }
+                self._persist_mid_eval_baseline(step=0)
+
+            # Emit baseline lines and deltas when baseline exists.
+            if self._mid_eval_baseline:
+                for key, baseline_val in self._mid_eval_baseline.items():
+                    log_dict[f"{key}_baseline"] = float(baseline_val)
+                    if key in log_dict and isinstance(log_dict[key], (int, float)):
+                        log_dict[f"{key}_delta"] = float(log_dict[key]) - float(baseline_val)
+
             logger.info(
                 "[mid-eval step=%s] complete: pass@1=%.4f pass@3=%.4f problems=%d n_gen=%d",
                 step,
@@ -591,8 +721,7 @@ class TimedGRPOTrainer(GRPOTrainer):
             if (
                 self._mid_eval_enabled
                 and self._eval_problems
-                and step >= MID_EVAL_START_STEP
-                and step % MID_EVAL_INTERVAL == 0
+                and step in MID_EVAL_STEPS
                 and step != self._last_mid_eval_step
                 and (not hasattr(self, "is_world_process_zero") or self.is_world_process_zero())
             ):
@@ -777,8 +906,7 @@ def main():
             "format_penalty_fence": FORMAT_PENALTY_FENCE,
             "resume_from_checkpoint": args.resume_from_checkpoint,
             "mid_eval_enabled": MID_EVAL_ENABLED,
-            "mid_eval_interval": MID_EVAL_INTERVAL,
-            "mid_eval_start_step": MID_EVAL_START_STEP,
+            "mid_eval_steps": sorted(MID_EVAL_STEPS),
             "mid_eval_n_generations": MID_EVAL_N_GENERATIONS,
         })
 
@@ -786,9 +914,15 @@ def main():
     logger.info("Loading training data...")
     apps_problems = load_problems(APPS_CLEAN_PATH, "apps")
     lcb_problems = load_problems(LCB_SEEN_PATH, "lcb_seen")
-    all_problems = apps_problems + lcb_problems
+    taco_problems = load_problems(TACO_CLEAN_PATH, "taco_verified")
+    all_problems = apps_problems + lcb_problems + taco_problems
 
-    logger.info(f"APPS: {len(apps_problems)} problems, LCB: {len(lcb_problems)} problems")
+    logger.info(
+        "APPS: %d problems, LCB: %d problems, TACO: %d problems",
+        len(apps_problems),
+        len(lcb_problems),
+        len(taco_problems),
+    )
 
     # Group by difficulty
     problems_by_diff = {"easy": [], "medium": [], "hard": []}
@@ -800,13 +934,15 @@ def main():
     for d, ps in problems_by_diff.items():
         logger.info(f"  {d}: {len(ps)} problems")
 
+    diff_queues = build_diff_queues(problems_by_diff)
+
     # Pre-build curriculum dataset in optimizer-step order.
     # One row group per optimizer step. With shuffle_dataset=False, the trainer
     # consumes rows in this exact order, so curriculum "step" matches global_step.
     logger.info("Building curriculum-weighted dataset...")
     all_sampled = []
     for step in range(max_steps):
-        batch = sample_batch(problems_by_diff, step, batch_size)
+        batch = sample_batch(problems_by_diff, step, batch_size, queues=diff_queues)
         all_sampled.extend(batch)
     dataset = problems_to_dataset(all_sampled)
 
@@ -960,8 +1096,7 @@ def main():
         "format_penalty_strict": float(FORMAT_PENALTY_STRICT),
         "format_penalty_fence": float(FORMAT_PENALTY_FENCE),
         "mid_eval_enabled": bool(MID_EVAL_ENABLED),
-        "mid_eval_interval": int(MID_EVAL_INTERVAL),
-        "mid_eval_start_step": int(MID_EVAL_START_STEP),
+        "mid_eval_steps": sorted(int(s) for s in MID_EVAL_STEPS),
         "mid_eval_n_generations": int(MID_EVAL_N_GENERATIONS),
         "resume_from_checkpoint": args.resume_from_checkpoint,
         "save_debug_details": bool(args.save_debug_details and (not args.smoke_test)),

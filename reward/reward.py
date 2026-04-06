@@ -38,6 +38,11 @@ from config import (
     # Misc
     GROUP_SIZE,
     MAX_NEW_TOKENS,
+    WARMUP_STEPS,
+    DYNAMIC_BASELINE_WINDOW_STEPS,
+    REWARD_STD_WARNING_THRESHOLD,
+    GRPO_ALL_ZERO_REF_MAX,
+    GRPO_ALL_PERFECT_REF_MAX,
     FORMAT_PENALTY_STRICT,
     FORMAT_PENALTY_FENCE,
     normalize_difficulty,
@@ -60,6 +65,13 @@ _train_debug_enabled = False
 _train_debug_path = ""
 _train_debug_fh = None
 _train_debug_call_idx = 0
+
+# Dynamic operational baselines from post-warmup early window.
+_metrics_step_idx = 0
+_reward_judge_baseline_s: float | None = None
+_failed_to_run_baseline_frac: float | None = None
+_reward_judge_samples: list[float] = []
+_failed_to_run_samples: list[float] = []
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +482,10 @@ def _log_metrics(
     presence_used_count=0,
 ):
     """Log comprehensive metrics to WandB and emit console warnings on threshold breaches."""
+    global _metrics_step_idx
+    global _reward_judge_baseline_s, _failed_to_run_baseline_frac
+    global _reward_judge_samples, _failed_to_run_samples
+    _metrics_step_idx += 1
     try:
         n = len(rewards)
         reward_arr = np.array(rewards)
@@ -542,6 +558,10 @@ def _log_metrics(
             "grpo/warn_reward_std_collapse": 0,
             "judge/rate_limit_count": 0,
             "judge/consecutive_rate_limit_steps": 0,
+            # Universal GRPO-side reference lines (for chart overlays).
+            "grpo/reward_std_ref_floor": float(REWARD_STD_WARNING_THRESHOLD),
+            "grpo/all_zero_ref_max": float(GRPO_ALL_ZERO_REF_MAX),
+            "grpo/all_perfect_ref_max": float(GRPO_ALL_PERFECT_REF_MAX),
         }
         if timing:
             log_dict.update(timing)
@@ -614,6 +634,32 @@ def _log_metrics(
         if exec_nonzero_mean is not None:
             log_dict["exec/nonzero_mean"] = exec_nonzero_mean
 
+        # Dynamic operational baselines (post-warmup early window median).
+        baseline_end_step = int(WARMUP_STEPS) + int(DYNAMIC_BASELINE_WINDOW_STEPS)
+        if (
+            _reward_judge_baseline_s is None
+            and _metrics_step_idx > int(WARMUP_STEPS)
+            and _metrics_step_idx <= baseline_end_step
+            and "timing/reward_judge_s" in log_dict
+        ):
+            _reward_judge_samples.append(float(log_dict["timing/reward_judge_s"]))
+        if (
+            _failed_to_run_baseline_frac is None
+            and _metrics_step_idx > int(WARMUP_STEPS)
+            and _metrics_step_idx <= baseline_end_step
+            and "exec/failed_to_run_fraction" in log_dict
+        ):
+            _failed_to_run_samples.append(float(log_dict["exec/failed_to_run_fraction"]))
+        if _metrics_step_idx > baseline_end_step:
+            if _reward_judge_baseline_s is None and _reward_judge_samples:
+                _reward_judge_baseline_s = float(np.median(_reward_judge_samples))
+            if _failed_to_run_baseline_frac is None and _failed_to_run_samples:
+                _failed_to_run_baseline_frac = float(np.median(_failed_to_run_samples))
+        if _reward_judge_baseline_s is not None:
+            log_dict["timing/reward_judge_s_baseline"] = float(_reward_judge_baseline_s)
+        if _failed_to_run_baseline_frac is not None:
+            log_dict["exec/failed_to_run_fraction_baseline"] = float(_failed_to_run_baseline_frac)
+
         # GRPO group diagnostics
         n_problems = n // GROUP_SIZE if GROUP_SIZE > 0 else 0
         if n_problems > 0 and n == n_problems * GROUP_SIZE:
@@ -635,9 +681,10 @@ def _log_metrics(
         warnings_fired = {}  # key → message
 
         reward_std_mean = log_dict.get("grpo/reward_std_mean")
-        if reward_std_mean is not None and reward_std_mean < 0.05:
+        if reward_std_mean is not None and reward_std_mean < REWARD_STD_WARNING_THRESHOLD:
             warnings_fired["grpo/warn_reward_std_collapse"] = (
-                f"GRPO signal collapsing — reward_std_mean={reward_std_mean:.4f} < 0.05. "
+                f"GRPO signal collapsing — reward_std_mean={reward_std_mean:.4f} < "
+                f"{REWARD_STD_WARNING_THRESHOLD:.2f}. "
                 "All rollouts getting similar rewards; advantage estimates are noise."
             )
             log_dict["grpo/warn_reward_std_collapse"] = 1
@@ -650,7 +697,7 @@ def _log_metrics(
             )
 
         all_zero_frac = log_dict.get("grpo/all_zero_fraction")
-        if all_zero_frac is not None and all_zero_frac > 0.5:
+        if all_zero_frac is not None and all_zero_frac > GRPO_ALL_ZERO_REF_MAX:
             warnings_fired["grpo/warn_all_zero_collapse"] = (
                 f"GRPO collapse — {all_zero_frac:.1%} of groups are all-zero reward. "
                 "Advantage is undefined for these groups; learning has stalled."
@@ -693,7 +740,7 @@ def _log_metrics(
             )
 
         all_perfect_frac = log_dict.get("grpo/all_perfect_fraction")
-        if all_perfect_frac is not None and all_perfect_frac > 0.5:
+        if all_perfect_frac is not None and all_perfect_frac > GRPO_ALL_PERFECT_REF_MAX:
             warnings_fired["warn/problems_too_easy"] = (
                 f"Problems too easy — {all_perfect_frac:.1%} of groups are all-perfect. "
                 "No contrast within groups; GRPO has no learning signal."

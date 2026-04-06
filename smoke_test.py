@@ -53,7 +53,7 @@ def test_imports():
 def test_config_logic():
     """Test config helpers."""
     print("\n--- Testing config logic ---")
-    from config import normalize_difficulty, get_curriculum_weights
+    from config import normalize_difficulty, get_curriculum_weights, get_curriculum_phase
     from problem_format import is_function_style_problem, get_function_name
 
     assert normalize_difficulty("introductory") == "easy"
@@ -65,12 +65,18 @@ def test_config_logic():
     w0 = get_curriculum_weights(0)
     assert w0["easy"] == 0.70 and w0["medium"] == 0.30 and w0["hard"] == 0.0
     w80 = get_curriculum_weights(80)
-    assert w80["easy"] == 0.50 and w80["medium"] == 0.50 and w80["hard"] == 0.0
-    w400 = get_curriculum_weights(400)
-    assert w400["easy"] == 0.30 and w400["medium"] == 0.50 and w400["hard"] == 0.20
-    w900 = get_curriculum_weights(900)
-    assert w900["easy"] == 0.15 and w900["medium"] == 0.40 and w900["hard"] == 0.45
+    assert w80["easy"] == 0.45 and w80["medium"] == 0.50 and w80["hard"] == 0.05
+    w250 = get_curriculum_weights(250)
+    assert w250["easy"] == 0.30 and w250["medium"] == 0.50 and w250["hard"] == 0.20
+    w700 = get_curriculum_weights(700)
+    assert w700["easy"] == 0.15 and w700["medium"] == 0.40 and w700["hard"] == 0.45
     print("  get_curriculum_weights: OK")
+
+    assert get_curriculum_phase(0) == 0
+    assert get_curriculum_phase(80) == 1
+    assert get_curriculum_phase(250) == 2
+    assert get_curriculum_phase(700) == 3
+    print("  get_curriculum_phase: OK")
 
     p_fn = {"fn_name": "twoSum", "is_leetcode": False}
     p_stdio = {"is_leetcode": False}
@@ -414,6 +420,11 @@ def test_data_loading():
     print(f"  LCB:  {len(lcb)} problems")
     tc2 = lcb[0].get("test_cases", [])
     print(f"  LCB first: diff={lcb[0]['difficulty']}, test_cases={len(tc2)}")
+
+    taco = _load_problems("data/clean/taco_verified_clean.jsonl", "taco_verified")
+    print(f"  TACO: {len(taco)} problems")
+    tc3 = taco[0].get("test_cases", [])
+    print(f"  TACO first: diff={taco[0]['difficulty']}, test_cases={len(tc3)}")
 
     # Test that a real APPS problem executes correctly
     for p in apps:
